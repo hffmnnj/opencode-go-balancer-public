@@ -1,0 +1,19 @@
+{
+  "name": "opencode-go-balancer",
+  "private": true,
+  "type": "module",
+  "main": "index.ts",
+  "exports": { ".": "./index.ts" },
+  "engines": { "node": ">=26" },
+  "scripts": {
+    "keys": "python3 scripts/set-keys.py",
+    "start": "node src/cli.ts",
+    "test": "node --test test/*.test.ts verification/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "2.0.32",
+    "@types/node": "26.6.5",
+    "typescript": "5.9.3"
+  }
+}
