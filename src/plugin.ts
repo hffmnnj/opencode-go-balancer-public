@@ -40,8 +40,9 @@ export default Plugin.define({
             properties: {
               cutoff: { type: "integer" }, nextConnection: { type: "string", enum: ["Default", "Secondary"] },
               pinnedSessions: { type: "integer" }, connectionID: { type: ["string", "null"] },
+              cooldowns: { type: "object", additionalProperties: { type: "integer" } },
             },
-            required: ["cutoff", "nextConnection", "pinnedSessions", "connectionID"], additionalProperties: false,
+            required: ["cutoff", "nextConnection", "pinnedSessions", "connectionID", "cooldowns"], additionalProperties: false,
           },
         },
       },
@@ -55,6 +56,13 @@ export default Plugin.define({
       if (!headers) return;
       // Preserve the original one-shot request and cancellation; never rewrite its body.
       headers.forEach((value, key) => event.request.headers.set(key, value));
+    }, { providerID: "opencode-go" });
+    await ctx.session.hook("http.response", async event => {
+      if (event.model.providerID !== "opencode-go") return;
+      // Only managed HTTP 429 evidence cools an account down. Never consume,
+      // replace, clone or alter the response or its body here.
+      if (event.response.status !== 429) return;
+      await router.recordLimit(event.sessionID, event.request.url, event.response.headers.get("retry-after"));
     }, { providerID: "opencode-go" });
     await ctx.session.hook("experimental.ws.handshake", async event => {
       if (event.model.providerID === "opencode-go") await router.rejectUnsupportedWebSocket(event.sessionID);

@@ -27,7 +27,10 @@ type State = {
   activeAtActivation: string;
   next: 0 | 1;
   pins: Record<string, string>;
+  cooldowns: Record<string, number>;
 };
+// Safe integers can exceed Date's range; every saved deadline must format as ISO.
+const maximumDateMs = 8_640_000_000_000_000;
 function readState(value: unknown): State {
   if (!value || typeof value !== "object") throw new Error("Invalid Go router state");
   const s = value as Partial<State>;
@@ -37,13 +40,44 @@ function readState(value: unknown): State {
       Object.values(s.pins).some(id => typeof id !== "string" || !id)) {
     throw new Error("Invalid Go router state");
   }
-  return s as State;
+  // Missing map predates the cooldown extension; default to empty so saved
+  // pins, cursor and cutoff migrate unchanged. Reject malformed maps.
+  let cooldowns: Record<string, number> = {};
+  if (s.cooldowns !== undefined) {
+    if (!s.cooldowns || typeof s.cooldowns !== "object" || Array.isArray(s.cooldowns) ||
+        Object.entries(s.cooldowns).some(([id, until]) => !id || !Number.isSafeInteger(until) ||
+          (until as number) < 0 || (until as number) > maximumDateMs)) {
+      throw new Error("Invalid Go router state");
+    }
+    cooldowns = { ...(s.cooldowns as Record<string, number>) };
+  }
+  return { ...(s as State), cooldowns };
 }
 
 export function assertGoDestination(input: string): void {
   const url = new URL(input);
   if (url.origin !== "https://opencode.ai" || url.username || url.password || url.hash ||
       !url.pathname.startsWith("/inference/go/")) throw new Error("Unexpected OpenCode Go destination");
+}
+
+const cooldownFallbackMs = 60_000;
+const cooldownMinimumMs = 1_000;
+function retryDelayMs(raw: string | null | undefined, t: number): number {
+  if (typeof raw !== "string") return cooldownFallbackMs;
+  const text = raw.trim();
+  if (!text) return cooldownFallbackMs;
+  if (/^-?\d+(\.\d+)?$/.test(text)) {
+    const seconds = Number(text);
+    if (!Number.isFinite(seconds) || seconds < 0) return cooldownFallbackMs;
+    const delay = seconds * 1000;
+    if (!Number.isFinite(delay) || delay > maximumDateMs - t) return cooldownFallbackMs;
+    return Math.max(cooldownMinimumMs, Math.ceil(delay));
+  }
+  const date = Date.parse(text);
+  if (!Number.isSafeInteger(date)) return cooldownFallbackMs;
+  if (date <= t) return cooldownMinimumMs;
+  if (date > Number.MAX_SAFE_INTEGER) return cooldownFallbackMs;
+  return Math.max(cooldownMinimumMs, date - t);
 }
 
 export function createConnectionRouter(ctx: RouterContext, now: () => number = Date.now) {
@@ -66,7 +100,7 @@ export function createConnectionRouter(ctx: RouterContext, now: () => number = D
     await connections();
     const active = await ctx.integration.connection.active("opencode");
     if (active?.type !== "credential" || active.method !== "oauth") throw new Error("Expected an active OpenCode OAuth connection");
-    const initial: State = { version: 1, cutoff: now(), activeAtActivation: active.id, next: 0, pins: {} };
+    const initial: State = { version: 1, cutoff: now(), activeAtActivation: active.id, next: 0, pins: {}, cooldowns: {} };
     await ctx.storage.set(stateKey, initial);
     return initial;
   }
@@ -79,7 +113,21 @@ export function createConnectionRouter(ctx: RouterContext, now: () => number = D
         nextConnection: saved.next === 0 ? "Default" : "Secondary",
         pinnedSessions: Object.keys(saved.pins).length,
         connectionID: sessionID && Object.hasOwn(saved.pins, sessionID) ? saved.pins[sessionID] : null,
+        cooldowns: { ...saved.cooldowns },
       };
+    }),
+    recordLimit: (sessionID: string, destination: string, retryAfter: string | null | undefined) => exclusive(async () => {
+      // Validate before touching state; never log the header or credentials.
+      assertGoDestination(destination);
+      const saved = await state();
+      // Sessions without a pin are unmanaged or historical: nothing to cool down.
+      const pinned = Object.hasOwn(saved.pins, sessionID) ? saved.pins[sessionID] : undefined;
+      if (!pinned) return;
+      const t = now();
+      const deadline = t + retryDelayMs(retryAfter, t);
+      const until = Math.max(saved.cooldowns[pinned] ?? 0, deadline);
+      if (!Number.isSafeInteger(until)) return;
+      await ctx.storage.set(stateKey, { ...saved, cooldowns: { ...saved.cooldowns, [pinned]: until } });
     }),
     rejectUnsupportedWebSocket: (sessionID: string) => exclusive(async () => {
       const saved = await state();
@@ -103,11 +151,26 @@ export function createConnectionRouter(ctx: RouterContext, now: () => number = D
           if (session.time.created <= saved.cutoff) return undefined;
         }
         const pair = await connections();
-        if (!id) {
-          const selectedID = pair[saved.next].id;
-          id = selectedID;
+        if (id) {
+          const pinned: ConnectionInfo | undefined = pair.find(c => c.id === id);
+          if (!pinned) throw new Error("Pinned Go connection is missing or renamed");
+          const until = saved.cooldowns[id] ?? 0;
+          // Never move a running session: fail its requests clearly while its
+          // account cools down instead of resolving, reallocating or switching.
+          if (until > now()) {
+            throw new Error(`Go connection ${pinned.label} is rate-limited until ${new Date(until).toISOString()}; session keeps its pinned connection`);
+          }
+        } else {
+          const t = now();
+          const order = [pair[saved.next], pair[saved.next === 0 ? 1 : 0]];
+          const chosen = order.find(c => (saved.cooldowns[c.id] ?? 0) <= t);
+          if (!chosen) {
+            const earliest = Math.min(saved.cooldowns[pair[0].id] ?? 0, saved.cooldowns[pair[1].id] ?? 0);
+            throw new Error(`All Go connections are rate-limited until ${new Date(earliest).toISOString()}; no session pin allocated`);
+          }
+          id = chosen.id;
           await ctx.storage.set(stateKey, {
-            ...saved, next: saved.next === 0 ? 1 : 0, pins: { ...saved.pins, [sessionID]: selectedID },
+            ...saved, next: chosen.id === pair[0].id ? 1 : 0, pins: { ...saved.pins, [sessionID]: chosen.id },
           });
         }
         const connection: ConnectionInfo | undefined = pair.find(c => c.id === id);

@@ -1,6 +1,6 @@
 # opencode-go-balancer
 
-> Status: activated on OpenCode V2 2.0.32. Typecheck and 54 tests pass;
+> Status: activated on OpenCode V2 2.0.32. Typecheck and 64 tests pass;
 > independent credential-boundary review passed. Two real Go agent sessions
 > completed on alternating saved connections with tool continuations.
 
@@ -12,6 +12,8 @@ provider. The authoritative contract is [`docs/SPEC.md`](docs/SPEC.md).
 - Alternate new Go agent sessions once at first launch between the two
   already-connected saved OAuth accounts named `Default` and `Secondary`
   (integration `opencode`, provider `opencode-go`).
+- For new sessions, skip a connection known to be rate-limited and use the
+  other account.
 - Pin the selected account for the whole session: later prompts, tool
   continuations, retries, auxiliary calls, and plugin reloads keep the same
   account so cache affinity is preserved.
@@ -26,8 +28,15 @@ provider. The authoritative contract is [`docs/SPEC.md`](docs/SPEC.md).
 - No API-key gateway, additional listener, or copied credential store.
 - No global account activation and no provider changes to running agents.
   Existing sessions are never switched during activation.
-- No failover on error: rate limits, auth failures, or a missing pinned
-  connection fail closed without switching to the other account.
+- Never fail over mid-session: rate limits, auth failures, or a missing pinned
+  connection do not switch an existing session to another account.
+- The cooldown extension records HTTP 429 responses without consuming their
+  bodies. Respect `Retry-After` seconds or dates, with a 60-second fallback when
+  absent or invalid. Keep the later deadline when rejections overlap.
+- While an account is cooling down, new sessions choose the other account;
+  existing sessions pinned to it return a clear error rather than sending more
+  requests or changing accounts. If both are limited, allocate nothing and
+  report the earliest availability. No request replay or active quota probing.
 - No changes to non-Go providers or model choices.
 
 ## Verified current state
@@ -69,8 +78,12 @@ npm run typecheck
 npm test
 ```
 
-The full suite includes 11 new connection-router tests and 43 historical gateway
+The full suite includes 21 connection-router tests and 43 historical gateway
 tests. Tests use fake native capabilities. Separately, native Go launches verified
 Default then Secondary with successful tool continuations, unchanged pins, shared
 status across two locations, and an unchanged main host PID. Forced live refresh
 failure, live retries, live compaction, and WebSocket behavior were not exercised.
+Cooldown behavior is covered with injected clocks and fake response hooks; a real
+upstream 429 was not deliberately induced. Cooldowns begin when a managed request
+observes HTTP 429; the router does not pre-query account quotas. A first request
+that discovers a limit remains pinned and is not replayed on the other account.
