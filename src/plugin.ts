@@ -1,7 +1,7 @@
 import { Plugin } from "@opencode/plugin";
-import { homedir } from "node:os";
-import { join } from "node:path";
-import { allowedQuery, matchRoute, readLocalToken, strippedHeaders } from "./gateway.ts";
+import { Rpc } from "@opencode/plugin/rpc";
+import { allowedQuery, matchRoute, strippedHeaders } from "./gateway.ts";
+import { createConnectionRouter } from "./connections.ts";
 
 export function redirectRequest(request: Request, sessionID: string, token: string, gatewayURL = "http://127.0.0.1:4790"): Request {
   const original = new URL(request.url);
@@ -28,14 +28,36 @@ export default Plugin.define({
   id: "opencode-go-balancer",
   async setup(ctx) {
     if (ctx.options.enabled !== true) return;
-    const token = readLocalToken(process.env.GO_BALANCER_TOKEN_FILE ?? join(homedir(), ".config/opencode-v2/opencode-go-balancer/local-token"));
-    await ctx.session.hook("http.request", event => {
-      event.request = redirectRequest(event.request, event.sessionID, token);
+    const router = createConnectionRouter(ctx);
+    await router.initialize();
+    await ctx.rpc.register(Rpc.define({
+      id: "go-router",
+      methods: {
+        status: {
+          input: { type: "object", properties: { sessionID: { type: "string" } }, additionalProperties: false },
+          output: {
+            type: "object",
+            properties: {
+              cutoff: { type: "integer" }, nextConnection: { type: "string", enum: ["Default", "Secondary"] },
+              pinnedSessions: { type: "integer" }, connectionID: { type: ["string", "null"] },
+            },
+            required: ["cutoff", "nextConnection", "pinnedSessions", "connectionID"], additionalProperties: false,
+          },
+        },
+      },
+      events: {},
+    }), {
+      status: async input => router.status((input as { sessionID?: string }).sessionID),
+    });
+    await ctx.session.hook("http.request", async event => {
+      if (event.model.providerID !== "opencode-go") return;
+      const headers = await router.headers(event.sessionID, event.request.url);
+      if (!headers) return;
+      // Preserve the original one-shot request and cancellation; never rewrite its body.
+      headers.forEach((value, key) => event.request.headers.set(key, value));
     }, { providerID: "opencode-go" });
-    // The gateway owns bounded, rejection-only retries. Do not multiply them
-    // through the session's default retry loop after an uncertain POST result.
-    await ctx.session.hook("retry", event => {
-      event.decision = { retry: false };
+    await ctx.session.hook("experimental.ws.handshake", async event => {
+      if (event.model.providerID === "opencode-go") await router.rejectUnsupportedWebSocket(event.sessionID);
     }, { providerID: "opencode-go" });
   },
 });
