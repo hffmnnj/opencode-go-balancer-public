@@ -1,0 +1,10 @@
+node_modules/
+legacy/
+*.log
+keys.json
+local-token
+*.env
+coverage/
+__pycache__/
+*.pyc
+!package-lock.json
