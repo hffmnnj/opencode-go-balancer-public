@@ -2,7 +2,9 @@
 
 > Status: activated on OpenCode V2 2.0.32. Typecheck and 64 tests pass;
 > independent credential-boundary review passed. Two real Go agent sessions
-> completed on alternating saved connections with tool continuations.
+> completed on alternating saved connections with tool continuations. A real
+> upstream HTTP 429 was later observed on `Default` and the cooldown path
+> behaved as specified.
 
 This repository provides an account-based, session-pinned router for the existing `opencode-go`
 provider. The authoritative contract is [`docs/SPEC.md`](docs/SPEC.md).
@@ -83,7 +85,14 @@ tests. Tests use fake native capabilities. Separately, native Go launches verifi
 Default then Secondary with successful tool continuations, unchanged pins, shared
 status across two locations, and an unchanged main host PID. Forced live refresh
 failure, live retries, live compaction, and WebSocket behavior were not exercised.
-Cooldown behavior is covered with injected clocks and fake response hooks; a real
-upstream 429 was not deliberately induced. Cooldowns begin when a managed request
-observes HTTP 429; the router does not pre-query account quotas. A first request
-that discovers a limit remains pinned and is not replayed on the other account.
+
+A real upstream HTTP 429 was observed on `Default` during normal operation. The
+router recorded a 60-second cooldown for that connection, and sessions already
+pinned to it failed with a clear error instead of switching accounts. One of
+those sessions resumed on its unchanged `Default` pin after the cooldown expired
+and completed. The cooldown was not induced deliberately. Cooldowns begin when a
+managed request observes HTTP 429; the router does not pre-query account quotas.
+A first request that discovers a limit remains pinned and is not replayed on the
+other account. The live response produced the same 60-second delay as the
+fallback, so `Retry-After` parsing, the both-accounts-limited rejection, and
+skipping a limited connection for a new session remain covered by tests only.
