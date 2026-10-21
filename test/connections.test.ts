@@ -35,7 +35,7 @@ function fixture() {
           if (failResolve) throw new Error("native refresh failed");
           if (missing) return undefined;
           return Credential.OAuth.make({ type: "oauth", methodID: Integration.MethodID.make("device"), access: `token-${c.id}`,
-            refresh: "unused-native-only", expires: 100_000,
+            refresh: "unused-native-only", expires: 1_000_000_000,
             metadata: { server: "https://opencode.ai/console", orgID: `workspace-${c.id}` } });
         },
       },
@@ -146,7 +146,7 @@ function savedPins(f: ReturnType<typeof fixture>) {
   };
 }
 
-test("a cooled account is skipped for new sessions while its pinned session fails without resolving", async () => {
+test("a cooled Default repins to Secondary before resolving and stays there after reload and expiry", async () => {
   const f = fixture();
   let t = 100;
   const router = createConnectionRouter(f.ctx, () => t);
@@ -155,16 +155,19 @@ test("a cooled account is skipped for new sessions while its pinned session fail
   assert.equal((await router.headers("b", destination))?.get("authorization"), "Bearer token-secondary-id");
   assert.deepEqual((await router.status()).cooldowns, {});
   // A managed 429 for the session pinned to Default cools that account for 120s.
-  await router.recordLimit("a", destination, "120");
+  await router.recordLimit("a", destination, "120", "default-id");
   assert.deepEqual((await router.status()).cooldowns, { "default-id": 120_100 });
   t = 200;
   // The cursor points at Default, yet new sessions skip the cooled account.
   assert.equal((await router.headers("c", destination))?.get("authorization"), "Bearer token-secondary-id");
   assert.equal((await router.headers("d", destination))?.get("authorization"), "Bearer token-secondary-id");
-  // The pinned session keeps its account: clear error, no resolve, no repin.
-  await assert.rejects(router.headers("a", destination), /rate-limited until/);
-  assert.deepEqual(f.resolved, ["default-id", "secondary-id", "secondary-id", "secondary-id"]);
-  assert.deepEqual(savedPins(f).pins, { a: "default-id", b: "secondary-id", c: "secondary-id", d: "secondary-id" });
+  const rerouted = await router.headers("a", destination);
+  assert.equal(rerouted?.get("authorization"), "Bearer token-secondary-id");
+  assert.equal(rerouted?.get("x-opencode-org-id"), "workspace-secondary-id");
+  assert.deepEqual(savedPins(f).pins, { a: "secondary-id", b: "secondary-id", c: "secondary-id", d: "secondary-id" });
+  t = 130_000;
+  const reloaded = createConnectionRouter(f.ctx, () => t);
+  assert.equal((await reloaded.headers("a", destination))?.get("authorization"), "Bearer token-secondary-id");
   // The healthy pinned session is unaffected.
   assert.equal((await router.headers("b", destination))?.get("x-opencode-org-id"), "workspace-secondary-id");
 });
@@ -176,32 +179,39 @@ test("a cooled Secondary is skipped once the cursor points at it", async () => {
   await router.initialize();
   assert.equal((await router.headers("a", destination))?.get("authorization"), "Bearer token-default-id");
   assert.equal((await router.headers("b", destination))?.get("authorization"), "Bearer token-secondary-id");
-  await router.recordLimit("b", destination, "120");
+  await router.recordLimit("b", destination, "120", "secondary-id");
   t = 200;
   // Cursor points at Default, which is healthy, so alternation continues.
   assert.equal((await router.headers("c", destination))?.get("authorization"), "Bearer token-default-id");
   // Cursor now points at cooled Secondary, so the new session skips to Default.
   assert.equal((await router.headers("d", destination))?.get("authorization"), "Bearer token-default-id");
-  await assert.rejects(router.headers("b", destination), /rate-limited until/);
-  assert.deepEqual(f.resolved, ["default-id", "secondary-id", "default-id", "default-id"]);
-  assert.deepEqual(savedPins(f).pins, { a: "default-id", b: "secondary-id", c: "default-id", d: "default-id" });
+  const retried = await router.headers("b", destination);
+  assert.equal(retried?.get("authorization"), "Bearer token-default-id");
+  assert.equal(retried?.get("x-opencode-org-id"), "workspace-default-id");
+  assert.deepEqual(savedPins(f).pins, { a: "default-id", b: "default-id", c: "default-id", d: "default-id" });
 });
 
-test("new sessions allocate nothing while both accounts cool down", async () => {
+test("both cooled accounts still route to the earliest expiry and preserve pins on equal deadlines", async () => {
   const f = fixture();
   let t = 100;
   const router = createConnectionRouter(f.ctx, () => t);
   await router.initialize();
   await router.headers("a", destination);
   await router.headers("b", destination);
-  await router.recordLimit("a", destination, "120");
-  await router.recordLimit("b", destination, "300");
+  await router.recordLimit("a", destination, "120", "default-id");
+  await router.recordLimit("b", destination, "300", "secondary-id");
   t = 200;
-  await assert.rejects(router.headers("c", destination), /All Go connections are rate-limited until .*; no session pin allocated/);
-  await assert.rejects(router.headers("c", destination), new RegExp(new Date(120_100).toISOString().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-  assert.deepEqual(f.resolved, ["default-id", "secondary-id"]);
-  assert.deepEqual(savedPins(f).pins, { a: "default-id", b: "secondary-id" });
-  assert.equal(savedPins(f).next, 0);
+  assert.equal((await router.headers("c", destination))?.get("authorization"), "Bearer token-default-id");
+  assert.equal((await router.headers("b", destination))?.get("authorization"), "Bearer token-default-id");
+  assert.deepEqual(savedPins(f).pins, { a: "default-id", b: "default-id", c: "default-id" });
+  assert.equal(await router.hasHealthyConnection("a"), false);
+  t = 100;
+  await router.recordLimit("a", destination, "300", "default-id");
+  assert.equal((await router.headers("a", destination))?.get("authorization"), "Bearer token-default-id");
+  // The allocation cursor points at Secondary. A tied, cooled Secondary pin
+  // must remain Secondary too, rather than always preferring Default.
+  assert.equal((await router.headers("d", destination))?.get("authorization"), "Bearer token-secondary-id");
+  assert.equal((await router.headers("d", destination))?.get("authorization"), "Bearer token-secondary-id");
 });
 
 test("expired cooldowns restore normal alternation", async () => {
@@ -211,7 +221,7 @@ test("expired cooldowns restore normal alternation", async () => {
   await router.initialize();
   await router.headers("a", destination);
   // Zero seconds still cools for one second instead of allowing an immediate retry loop.
-  await router.recordLimit("a", destination, "0");
+  await router.recordLimit("a", destination, "0", "default-id");
   assert.deepEqual((await router.status()).cooldowns, { "default-id": 1100 });
   t = 500;
   assert.equal((await router.headers("b", destination))?.get("authorization"), "Bearer token-secondary-id");
@@ -226,26 +236,26 @@ test("retry-after accepts seconds and HTTP dates, keeps the later deadline, and 
   const router = createConnectionRouter(f.ctx, () => t);
   await router.initialize();
   await router.headers("a", destination);
-  await router.recordLimit("a", destination, "120");
+  await router.recordLimit("a", destination, "120", "default-id");
   assert.deepEqual((await router.status()).cooldowns, { "default-id": 120_100 });
   // A shorter valid delay never shortens the existing later deadline.
-  await router.recordLimit("a", destination, "60");
+  await router.recordLimit("a", destination, "60", "default-id");
   assert.deepEqual((await router.status()).cooldowns, { "default-id": 120_100 });
   // Garbage never shortens it either: the 60s fallback loses to the later deadline.
-  await router.recordLimit("a", destination, "not-a-retry-after");
+  await router.recordLimit("a", destination, "not-a-retry-after", "default-id");
   assert.deepEqual((await router.status()).cooldowns, { "default-id": 120_100 });
   // A legitimate long delay is honored without an arbitrary cap.
-  await router.recordLimit("a", destination, "3600");
+  await router.recordLimit("a", destination, "3600", "default-id");
   assert.deepEqual((await router.status()).cooldowns, { "default-id": 3_600_100 });
 
   const dated = fixture();
   const drouter = createConnectionRouter(dated.ctx, () => t);
   await drouter.initialize();
   await drouter.headers("a", destination);
-  await drouter.recordLimit("a", destination, new Date(9_000).toUTCString());
+  await drouter.recordLimit("a", destination, new Date(9_000).toUTCString(), "default-id");
   assert.deepEqual((await drouter.status()).cooldowns, { "default-id": 9_000 });
   // A date at or before now cools for one second instead of expiring immediately.
-  await drouter.recordLimit("a", destination, new Date(50).toUTCString());
+  await drouter.recordLimit("a", destination, new Date(50).toUTCString(), "default-id");
   assert.deepEqual((await drouter.status()).cooldowns, { "default-id": 9_000 });
 
   for (const retryAfter of ["banana", "-5", "", "   ", "9000000000000", "99999999999999999999", "Infinity", null]) {
@@ -253,7 +263,7 @@ test("retry-after accepts seconds and HTTP dates, keeps the later deadline, and 
     const grouter = createConnectionRouter(g.ctx, () => t);
     await grouter.initialize();
     await grouter.headers("a", destination);
-    await grouter.recordLimit("a", destination, retryAfter);
+    await grouter.recordLimit("a", destination, retryAfter, "default-id");
     assert.deepEqual((await grouter.status()).cooldowns, { "default-id": 60_100 }, `fallback for ${String(retryAfter)}`);
   }
 });
@@ -269,13 +279,13 @@ test("legacy state without cooldowns migrates unchanged and cooldowns survive re
   assert.deepEqual(await router.status("a"), {
     cutoff: 100, nextConnection: "Default", pinnedSessions: 1, connectionID: "default-id", cooldowns: {},
   });
-  await router.recordLimit("a", destination, "120");
+  await router.recordLimit("a", destination, "120", "default-id");
   const reloaded = createConnectionRouter(f.ctx, () => t);
   await reloaded.initialize();
   t = 200;
-  await assert.rejects(reloaded.headers("a", destination), /rate-limited until/);
+  assert.equal((await reloaded.headers("a", destination))?.get("authorization"), "Bearer token-secondary-id");
   assert.equal((await reloaded.headers("b", destination))?.get("authorization"), "Bearer token-secondary-id");
-  assert.deepEqual(f.resolved, ["secondary-id"]);
+  assert.deepEqual(f.resolved, ["secondary-id", "secondary-id"]);
 });
 
 test("malformed cooldown maps are rejected", async () => {
@@ -289,19 +299,56 @@ test("malformed cooldown maps are rejected", async () => {
   }
 });
 
+test("concurrent repins are durable before resolving and never change global activation or the cursor", async () => {
+  const f = fixture();
+  const router = createConnectionRouter(f.ctx, () => 100);
+  await router.initialize();
+  await router.headers("a", destination);
+  await router.recordLimit("a", destination, "120", "default-id");
+  const resolve = f.ctx.integration.connection.resolve;
+  f.ctx.integration.connection = {
+    ...f.ctx.integration.connection,
+    resolve: async connection => {
+      assert.equal(savedPins(f).pins.a, "secondary-id");
+      return resolve(connection);
+    },
+  };
+  const reloaded = createConnectionRouter(f.ctx, () => 100);
+  const results = await Promise.all([router.headers("a", destination), reloaded.headers("a", destination)]);
+  assert.deepEqual(results.map(h => [h?.get("authorization"), h?.get("x-opencode-org-id")]), [
+    ["Bearer token-secondary-id", "workspace-secondary-id"], ["Bearer token-secondary-id", "workspace-secondary-id"],
+  ]);
+  assert.equal(savedPins(f).next, 1);
+  assert.deepEqual(await f.ctx.integration.connection.active("opencode"),
+    { type: "credential", id: "secondary-id", label: "Secondary", method: "oauth" });
+});
+
+test("failed durable repin and native refresh fail closed without resolving a fallback account", async () => {
+  for (const failure of ["write", "refresh"] as const) {
+    const f = fixture();
+    const router = createConnectionRouter(f.ctx, () => 100);
+    await router.headers("a", destination);
+    await router.recordLimit("a", destination, "120", "default-id");
+    if (failure === "write") f.failWrite(); else f.failResolve();
+    await assert.rejects(router.headers("a", destination), failure === "write" ? /disk unavailable/ : /native refresh failed/);
+    assert.deepEqual(f.resolved, failure === "write" ? ["default-id"] : ["default-id", "secondary-id"]);
+    assert.equal(savedPins(f).pins.a, failure === "write" ? "default-id" : "secondary-id");
+  }
+});
+
 test("limits are ignored for sessions without a pin and invalid destinations are rejected first", async () => {
   const f = fixture();
   const router = createConnectionRouter(f.ctx, () => 100);
   await router.initialize();
-  await router.recordLimit("unknown", destination, "120");
-  await router.recordLimit("old-nothing", destination, "120");
+  await router.recordLimit("unknown", destination, "120", "default-id");
+  await router.recordLimit("old-nothing", destination, "120", "default-id");
   assert.deepEqual((await router.status()).cooldowns, {});
   assert.equal(f.values.size, 1);
-  await assert.rejects(router.recordLimit("unknown", "https://evil.test/inference/go/a", "120"), /Unexpected OpenCode Go destination/);
+  await assert.rejects(router.recordLimit("unknown", "https://evil.test/inference/go/a", "120", "default-id"), /Unexpected OpenCode Go destination/);
   assert.equal(f.values.size, 1);
   await router.headers("a", destination);
   const before = JSON.stringify(f.values.get("connections/v1"));
-  await assert.rejects(router.recordLimit("a", "http://opencode.ai/inference/go/a", "5"), /Unexpected OpenCode Go destination/);
+  await assert.rejects(router.recordLimit("a", "http://opencode.ai/inference/go/a", "5", "default-id"), /Unexpected OpenCode Go destination/);
   assert.equal(JSON.stringify(f.values.get("connections/v1")), before);
   assert.deepEqual((await router.status()).cooldowns, {});
 });

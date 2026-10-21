@@ -81,6 +81,43 @@ function retryDelayMs(raw: string | null | undefined, t: number): number {
 }
 
 export function createConnectionRouter(ctx: RouterContext, now: () => number = Date.now) {
+  async function route(sessionID: string, destination: string): Promise<{ headers: Headers; connectionID: string } | undefined> {
+    // Validate before storage access or credential resolution.
+    assertGoDestination(destination);
+    return exclusive(async () => {
+      const saved = await state();
+      const pinned = Object.hasOwn(saved.pins, sessionID) ? saved.pins[sessionID] : undefined;
+      if (!pinned) {
+        const session = await ctx.session.get({ sessionID });
+        if (!Number.isFinite(session.time.created)) throw new Error("Missing session creation time");
+        if (session.time.created <= saved.cutoff) return undefined;
+      }
+      const pair = await connections();
+      if (pinned && !pair.some(c => c.id === pinned)) throw new Error("Pinned Go connection is missing or renamed");
+      const t = now();
+      const preferred = pinned ? pair.find(c => c.id === pinned)! : pair[saved.next];
+      const other = pair.find(c => c.id !== preferred.id)!;
+      // Keep healthy pins. If both are cooling, prefer the earlier deadline,
+      // retaining affinity on ties, and leave real unavailability to native backoff.
+      const chosen = (saved.cooldowns[preferred.id] ?? 0) <= t ? preferred
+        : (saved.cooldowns[other.id] ?? 0) <= t ? other
+        : (saved.cooldowns[other.id] ?? 0) < (saved.cooldowns[preferred.id] ?? 0) ? other : preferred;
+      if (chosen.id !== pinned) {
+        await ctx.storage.set(stateKey, {
+          ...saved, next: pinned ? saved.next : chosen.id === pair[0].id ? 1 : 0,
+          pins: { ...saved.pins, [sessionID]: chosen.id },
+        });
+      }
+      const value = await ctx.integration.connection.resolve(chosen);
+      if (value?.type !== "oauth" || !value.access || value.expires <= now() ||
+          value.metadata?.server !== "https://opencode.ai/console" ||
+          typeof value.metadata.orgID !== "string" || !value.metadata.orgID) {
+        throw new Error("Pinned Go OAuth connection is unusable");
+      }
+      return { connectionID: chosen.id,
+        headers: new Headers({ authorization: `Bearer ${value.access}`, "x-opencode-org-id": value.metadata.orgID }) };
+    });
+  }
   async function connections() {
     const integration = await ctx.integration.get({ integrationID: "opencode" });
     const pair = ["Default", "Secondary"].map(label => {
@@ -116,18 +153,25 @@ export function createConnectionRouter(ctx: RouterContext, now: () => number = D
         cooldowns: { ...saved.cooldowns },
       };
     }),
-    recordLimit: (sessionID: string, destination: string, retryAfter: string | null | undefined) => exclusive(async () => {
+    recordLimit: (sessionID: string, destination: string, retryAfter: string | null | undefined, connectionID: string) => exclusive(async () => {
       // Validate before touching state; never log the header or credentials.
       assertGoDestination(destination);
       const saved = await state();
       // Sessions without a pin are unmanaged or historical: nothing to cool down.
-      const pinned = Object.hasOwn(saved.pins, sessionID) ? saved.pins[sessionID] : undefined;
-      if (!pinned) return;
+      if (!Object.hasOwn(saved.pins, sessionID)) return;
+      if (!(await connections()).some(c => c.id === connectionID)) throw new Error("Pinned Go connection is missing or renamed");
       const t = now();
       const deadline = t + retryDelayMs(retryAfter, t);
-      const until = Math.max(saved.cooldowns[pinned] ?? 0, deadline);
+      const until = Math.max(saved.cooldowns[connectionID] ?? 0, deadline);
       if (!Number.isSafeInteger(until)) return;
-      await ctx.storage.set(stateKey, { ...saved, cooldowns: { ...saved.cooldowns, [pinned]: until } });
+      await ctx.storage.set(stateKey, { ...saved, cooldowns: { ...saved.cooldowns, [connectionID]: until } });
+    }),
+    hasHealthyConnection: (sessionID: string) => exclusive(async () => {
+      const saved = await state();
+      if (!Object.hasOwn(saved.pins, sessionID)) return false;
+      const pair = await connections();
+      if (!pair.some(c => c.id === saved.pins[sessionID])) throw new Error("Pinned Go connection is missing or renamed");
+      return pair.some(c => (saved.cooldowns[c.id] ?? 0) <= now());
     }),
     rejectUnsupportedWebSocket: (sessionID: string) => exclusive(async () => {
       const saved = await state();
@@ -139,50 +183,8 @@ export function createConnectionRouter(ctx: RouterContext, now: () => number = D
       throw new Error("Pinned Go routing requires native HTTP transport");
     }),
     async headers(sessionID: string, destination: string): Promise<Headers | undefined> {
-      // Never resolve a secret for a configurable or redirected destination.
-      assertGoDestination(destination);
-      return exclusive(async () => {
-        const saved = await state();
-        let id = Object.hasOwn(saved.pins, sessionID) ? saved.pins[sessionID] : undefined;
-        if (!id) {
-          const session = await ctx.session.get({ sessionID });
-          if (!Number.isFinite(session.time.created)) throw new Error("Missing session creation time");
-          // Historical Go identity is not recorded by V2. Do not assert an unknown pin.
-          if (session.time.created <= saved.cutoff) return undefined;
-        }
-        const pair = await connections();
-        if (id) {
-          const pinned: ConnectionInfo | undefined = pair.find(c => c.id === id);
-          if (!pinned) throw new Error("Pinned Go connection is missing or renamed");
-          const until = saved.cooldowns[id] ?? 0;
-          // Never move a running session: fail its requests clearly while its
-          // account cools down instead of resolving, reallocating or switching.
-          if (until > now()) {
-            throw new Error(`Go connection ${pinned.label} is rate-limited until ${new Date(until).toISOString()}; session keeps its pinned connection`);
-          }
-        } else {
-          const t = now();
-          const order = [pair[saved.next], pair[saved.next === 0 ? 1 : 0]];
-          const chosen = order.find(c => (saved.cooldowns[c.id] ?? 0) <= t);
-          if (!chosen) {
-            const earliest = Math.min(saved.cooldowns[pair[0].id] ?? 0, saved.cooldowns[pair[1].id] ?? 0);
-            throw new Error(`All Go connections are rate-limited until ${new Date(earliest).toISOString()}; no session pin allocated`);
-          }
-          id = chosen.id;
-          await ctx.storage.set(stateKey, {
-            ...saved, next: chosen.id === pair[0].id ? 1 : 0, pins: { ...saved.pins, [sessionID]: chosen.id },
-          });
-        }
-        const connection: ConnectionInfo | undefined = pair.find(c => c.id === id);
-        if (!connection) throw new Error("Pinned Go connection is missing or renamed");
-        const value = await ctx.integration.connection.resolve(connection);
-        if (value?.type !== "oauth" || !value.access || value.expires <= now() ||
-            value.metadata?.server !== "https://opencode.ai/console" ||
-            typeof value.metadata.orgID !== "string" || !value.metadata.orgID) {
-          throw new Error("Pinned Go OAuth connection is unusable");
-        }
-        return new Headers({ authorization: `Bearer ${value.access}`, "x-opencode-org-id": value.metadata.orgID });
-      });
+      return (await route(sessionID, destination))?.headers;
     },
+    route,
   };
 }

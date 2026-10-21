@@ -7,6 +7,7 @@ import type { RouterContext } from "../src/connections.ts";
 type HttpEvent = Parameters<Parameters<Plugin.Context["session"]["hook"]>[1]>[0];
 type RequestEvent = Extract<HttpEvent, { request: Request }>;
 type ResponseEvent = Extract<HttpEvent, { response: Response }>;
+type RetryEvent = Extract<HttpEvent, { decision: unknown }>;
 type StatusResult = { cutoff: number; nextConnection: string; pinnedSessions: number; connectionID: string | null; cooldowns: Record<string, number> };
 
 async function fixture() {
@@ -14,6 +15,7 @@ async function fixture() {
   const hooks: string[] = [];
   let request: ((event: RequestEvent) => void | Promise<void>) | undefined;
   let response: ((event: ResponseEvent) => void | Promise<void>) | undefined;
+  let retry: ((event: RetryEvent) => void | Promise<void>) | undefined;
   let status: ((input: { sessionID?: string }) => Promise<unknown>) | undefined;
   const ctx = {
     options: { enabled: true },
@@ -38,6 +40,7 @@ async function fixture() {
         assert.deepEqual(scope, { providerID: "opencode-go" });
         if (name === "http.request") request = handler as (event: RequestEvent) => void | Promise<void>;
         if (name === "http.response") response = handler as (event: ResponseEvent) => void | Promise<void>;
+        if (name === "retry") retry = handler as (event: RetryEvent) => void | Promise<void>;
       },
     },
   };
@@ -46,7 +49,8 @@ async function fixture() {
   assert.ok(request);
   assert.ok(response);
   assert.ok(status);
-  return { hooks, call: request, respond: response, status };
+  assert.ok(retry);
+  return { hooks, call: request, respond: response, retry, status };
 }
 
 function responseEvent(sessionID: string, statusCode: number, retryAfter?: string, providerID = "opencode-go") {
@@ -68,9 +72,15 @@ function event(sessionID: string, kind: "primary" | "title" | "compaction" | "ge
   } as RequestEvent;
 }
 
+function retryEvent(sessionID: string, status: number, providerID = "opencode-go"): RetryEvent {
+  return { sessionID, agent: "build", model: { providerID, id: "unchanged-model" },
+    error: { type: "rate_limit", message: "upstream error", status }, attempt: 2,
+    decision: { retry: true, delay: 120_000 } } as RetryEvent;
+}
+
 test("auxiliary-first, primary, continuation, title and compaction share one pin; native retries remain enabled", async () => {
   const f = await fixture();
-  assert.deepEqual(f.hooks, ["http.request", "http.response", "experimental.ws.handshake"]);
+  assert.deepEqual(f.hooks, ["http.request", "http.response", "retry", "experimental.ws.handshake"]);
   for (const kind of ["title", "primary", "primary", "compaction", "generate"] as const) {
     const e = event("one", kind);
     await f.call(e);
@@ -124,11 +134,12 @@ test("non-Go and historical-session requests retain their original account heade
   }
 });
 
-test("a managed 429 cools the pinned account: new sessions skip it, the pinned session keeps its pin", async () => {
+test("a managed 429 redirects native retry to Secondary with paired headers and a durable pin", async () => {
   const f = await fixture();
-  await f.call(event("one"));
+  const first = event("one");
+  await f.call(first);
   // The managed 429 for the session pinned to Default cools that account for 120s.
-  await f.respond(responseEvent("one", 429, "120"));
+  await f.respond({ ...responseEvent("one", 429, "120"), request: first.request });
   const cooled = await f.status({ sessionID: "one" }) as StatusResult;
   assert.deepEqual(Object.keys(cooled.cooldowns), ["d"]);
   assert.ok(cooled.cooldowns["d"]! > Date.now());
@@ -141,15 +152,20 @@ test("a managed 429 cools the pinned account: new sessions skip it, the pinned s
   await f.call(third);
   assert.equal(third.request.headers.get("authorization"), "Bearer access-s");
   assert.equal(third.request.headers.get("x-opencode-org-id"), "org-s");
-  // The pinned session keeps Default: clear error, original headers, no switch.
+  const decision = retryEvent("one", 429);
+  await f.retry(decision);
+  assert.deepEqual(decision.decision, { retry: true, delay: 100 });
   const retry = event("one");
-  await assert.rejects((async () => f.call(retry))(), /rate-limited until/);
-  assert.equal(retry.request.headers.get("authorization"), "Bearer active-secondary");
+  await f.call(retry);
+  assert.equal(retry.request.headers.get("authorization"), "Bearer access-s");
+  assert.equal(retry.request.headers.get("x-opencode-org-id"), "org-s");
+  assert.equal((await f.status({ sessionID: "one" }) as StatusResult).connectionID, "s");
 });
 
 test("only managed 429 responses are recorded and the response is never altered", async () => {
   const f = await fixture();
-  await f.call(event("one"));
+  const first = event("one");
+  await f.call(first);
   // Other statuses, other providers and pin-less sessions record nothing.
   await f.respond(responseEvent("one", 500, "120"));
   await f.respond(responseEvent("one", 403, "120"));
@@ -159,6 +175,7 @@ test("only managed 429 responses are recorded and the response is never altered"
   assert.deepEqual((await f.status({}) as StatusResult).cooldowns, {});
   // A managed 429 records the cooldown without consuming or replacing the response.
   const seen = responseEvent("one", 429, "120");
+  Object.assign(seen, { request: first.request });
   const original = seen.response;
   await f.respond(seen);
   assert.equal(seen.response, original);
@@ -169,4 +186,40 @@ test("only managed 429 responses are recorded and the response is never altered"
   assert.deepEqual(Object.keys(cooled.cooldowns), ["d"]);
   assert.ok(cooled.cooldowns["d"]! > Date.now());
   assert.doesNotMatch(JSON.stringify(cooled), /access-|org-|refresh/);
+});
+
+test("delayed concurrent 429s cool their actual request account, not the new session pin", async () => {
+  const f = await fixture();
+  const first = event("one");
+  const delayed = event("one", "title");
+  await Promise.all([f.call(first), f.call(delayed)]);
+  await f.respond({ ...responseEvent("one", 429, "120"), request: first.request });
+  const retries = [event("one"), event("one", "compaction")];
+  await Promise.all(retries.map(e => f.call(e)));
+  for (const e of retries) {
+    assert.equal(e.request.headers.get("authorization"), "Bearer access-s");
+    assert.equal(e.request.headers.get("x-opencode-org-id"), "org-s");
+  }
+  await f.respond({ ...responseEvent("one", 429, "300"), request: delayed.request });
+  const after = await f.status({ sessionID: "one" }) as StatusResult;
+  assert.equal(after.connectionID, "s");
+  assert.deepEqual(Object.keys(after.cooldowns), ["d"]);
+  await f.respond({ ...responseEvent("one", 429, "400"), request: retries[0]!.request });
+  const decision = retryEvent("one", 429);
+  await f.retry(decision);
+  assert.deepEqual(decision.decision, { retry: true, delay: 120_000 });
+  const bothCooled = event("one");
+  await f.call(bothCooled);
+  assert.equal(bothCooled.request.headers.get("authorization"), "Bearer access-d");
+});
+
+test("retry hook leaves auth, network, non-Go and unmanaged retry decisions unchanged", async () => {
+  const f = await fixture();
+  await f.call(event("one"));
+  for (const e of [retryEvent("one", 401), retryEvent("one", 500),
+    retryEvent("one", 429, "other-provider"), retryEvent("old", 429), retryEvent("unknown", 429)]) {
+    e.decision = { retry: false };
+    await f.retry(e);
+    assert.deepEqual(e.decision, { retry: false });
+  }
 });

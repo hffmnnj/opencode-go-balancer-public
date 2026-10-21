@@ -1,10 +1,8 @@
 # opencode-go-balancer
 
-> Status: activated on OpenCode V2 2.0.32. Typecheck and 64 tests pass;
-> independent credential-boundary review passed. Two real Go agent sessions
-> completed on alternating saved connections with tool continuations. A real
-> upstream HTTP 429 was later observed on `Default` and the cooldown path
-> behaved as specified.
+> The account router is activated on OpenCode V2 2.0.32. The current contract
+> redirects rate-limited sessions to the other saved account rather than raising
+> a local cooldown exception. See the roadmap for verification of this revision.
 
 This repository provides an account-based, session-pinned router for the existing `opencode-go`
 provider. The authoritative contract is [`docs/SPEC.md`](docs/SPEC.md).
@@ -16,9 +14,10 @@ provider. The authoritative contract is [`docs/SPEC.md`](docs/SPEC.md).
   (integration `opencode`, provider `opencode-go`).
 - For new sessions, skip a connection known to be rate-limited and use the
   other account.
-- Pin the selected account for the whole session: later prompts, tool
-  continuations, retries, auxiliary calls, and plugin reloads keep the same
-  account so cache affinity is preserved.
+- Keep the selected account sticky across normal requests and plugin reloads.
+  If it is rate-limited, redirect the next request or native retry to the healthy
+  other account and persist that selection. The session does not switch back
+  merely because the original account's cooldown expires.
 - Resolve credentials through OpenCode's native credential lifecycle and
   refresh. No copied tokens, no API-key files.
 - Leave sessions created at or before the first activation cutoff unmanaged.
@@ -30,15 +29,16 @@ provider. The authoritative contract is [`docs/SPEC.md`](docs/SPEC.md).
 - No API-key gateway, additional listener, or copied credential store.
 - No global account activation and no provider changes to running agents.
   Existing sessions are never switched during activation.
-- Never fail over mid-session: rate limits, auth failures, or a missing pinned
-  connection do not switch an existing session to another account.
+- Redirect on explicit rate limits only. Auth failures, malformed router state,
+  unsafe destinations, or missing/ambiguous saved connections still fail closed.
 - The cooldown extension records HTTP 429 responses without consuming their
   bodies. Respect `Retry-After` seconds or dates, with a 60-second fallback when
   absent or invalid. Keep the later deadline when rejections overlap.
-- While an account is cooling down, new sessions choose the other account;
-  existing sessions pinned to it return a clear error rather than sending more
-  requests or changing accounts. If both are limited, allocate nothing and
-  report the earliest availability. No request replay or active quota probing.
+- While an account is cooling down, both new and existing sessions choose the
+  healthy other account. If both are locally marked limited, choose the account
+  with the earliest deadline instead of raising a router cooldown exception.
+  Genuine upstream limits still use native retry/backoff; redirection cannot
+  manufacture quota. There is no custom fetch/replay loop or active quota probing.
 - No changes to non-Go providers or model choices.
 
 ## Verified current state
@@ -68,7 +68,8 @@ provider. The authoritative contract is [`docs/SPEC.md`](docs/SPEC.md).
   silently bypassing a pin. Current Go routes use native HTTP.
 - Do not delete router storage or disable/re-enable routing around new work if
   pin continuity is required. Token refresh is allowed; changing account identity
-  is not. Removing or renaming a required account fails closed.
+  is limited to explicit rate-limit redirection. Removing or renaming a required
+  account fails closed.
 - Activation and rollback are described in [`docs/DEPLOY.md`](docs/DEPLOY.md).
 
 ## Local checks
@@ -80,19 +81,16 @@ npm run typecheck
 npm test
 ```
 
-The full suite includes 21 connection-router tests and 43 historical gateway
-tests. Tests use fake native capabilities. Separately, native Go launches verified
-Default then Secondary with successful tool continuations, unchanged pins, shared
-status across two locations, and an unchanged main host PID. Forced live refresh
-failure, live retries, live compaction, and WebSocket behavior were not exercised.
+The full suite includes connection-router tests and 43 historical gateway tests.
+Hook tests use fake native capabilities, not a running host. Earlier native Go
+launches verified Default then Secondary with successful tool continuations,
+shared status across locations, and an unchanged main host PID. Forced live
+refresh failure, compaction, and WebSocket behavior were not exercised.
 
-A real upstream HTTP 429 was observed on `Default` during normal operation. The
-router recorded a 60-second cooldown for that connection, and sessions already
-pinned to it failed with a clear error instead of switching accounts. One of
-those sessions resumed on its unchanged `Default` pin after the cooldown expired
-and completed. The cooldown was not induced deliberately. Cooldowns begin when a
-managed request observes HTTP 429; the router does not pre-query account quotas.
-A first request that discovers a limit remains pinned and is not replayed on the
-other account. The live response produced the same 60-second delay as the
-fallback, so `Retry-After` parsing, the both-accounts-limited rejection, and
-skipping a limited connection for a new session remain covered by tests only.
+A real upstream HTTP 429 was observed on `Default` under the earlier strict-pin
+policy. That policy deliberately stopped affected sessions and has now been
+superseded at the user's request. Cooldowns begin when a managed request observes
+HTTP 429; the router does not pre-query account quotas. Account redirection uses
+native requests and retries, not a second credential store or a custom replay
+loop. Unit/hook coverage is not evidence of a live upstream 429 recovery; see
+the roadmap for current tested and untested paths.

@@ -29,6 +29,7 @@ export default Plugin.define({
   async setup(ctx) {
     if (ctx.options.enabled !== true) return;
     const router = createConnectionRouter(ctx);
+    const requestConnections = new WeakMap<Request, string>();
     await router.initialize();
     await ctx.rpc.register(Rpc.define({
       id: "go-router",
@@ -52,17 +53,24 @@ export default Plugin.define({
     });
     await ctx.session.hook("http.request", async event => {
       if (event.model.providerID !== "opencode-go") return;
-      const headers = await router.headers(event.sessionID, event.request.url);
-      if (!headers) return;
+      const routed = await router.route(event.sessionID, event.request.url);
+      if (!routed) return;
       // Preserve the original one-shot request and cancellation; never rewrite its body.
-      headers.forEach((value, key) => event.request.headers.set(key, value));
+      routed.headers.forEach((value, key) => event.request.headers.set(key, value));
+      requestConnections.set(event.request, routed.connectionID);
     }, { providerID: "opencode-go" });
     await ctx.session.hook("http.response", async event => {
       if (event.model.providerID !== "opencode-go") return;
       // Only managed HTTP 429 evidence cools an account down. Never consume,
       // replace, clone or alter the response or its body here.
       if (event.response.status !== 429) return;
-      await router.recordLimit(event.sessionID, event.request.url, event.response.headers.get("retry-after"));
+      const connectionID = requestConnections.get(event.request);
+      if (!connectionID) return;
+      await router.recordLimit(event.sessionID, event.request.url, event.response.headers.get("retry-after"), connectionID);
+    }, { providerID: "opencode-go" });
+    await ctx.session.hook("retry", async event => {
+      if (event.model.providerID !== "opencode-go" || event.error.status !== 429) return;
+      if (await router.hasHealthyConnection(event.sessionID)) event.decision = { retry: true, delay: 100 };
     }, { providerID: "opencode-go" });
     await ctx.session.hook("experimental.ws.handshake", async event => {
       if (event.model.providerID === "opencode-go") await router.rejectUnsupportedWebSocket(event.sessionID);
