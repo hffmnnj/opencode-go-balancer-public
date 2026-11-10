@@ -11,7 +11,13 @@ provider. The authoritative contract is [`docs/SPEC.md`](docs/SPEC.md).
 
 - Alternate new Go agent sessions once at first launch between the two
   already-connected saved OAuth accounts named `Default` and `Secondary`
-  (integration `opencode`, provider `opencode-go`).
+  (integration `opencode`, provider `opencode-go`). Hosts that name their
+  connections differently can override this with the plugin option
+  `connectionLabels` (two distinct nonempty strings, in primary/secondary
+  order); it defaults to `["Default", "Secondary"]`.
+- Platform: private credential files enforce POSIX `0600` mode and owner checks
+  on Linux/macOS (`~/.config/opencode-v2/opencode-go-balancer/`) and trust NTFS
+  ACLs on Windows (`~/.config/opencode/opencode-go-balancer/`).
 - For new sessions, skip a connection known to be rate-limited and use the
   other account.
 - Keep the selected account sticky across normal requests and plugin reloads.

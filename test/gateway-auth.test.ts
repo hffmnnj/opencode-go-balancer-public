@@ -177,7 +177,7 @@ describe("gateway local auth", () => {
     assert.equal(fake.hits.length, 0);
   });
 
-  it("keys_file_must_be_mode_0600", async () => {
+  it("keys_file_must_be_mode_0600", { skip: process.platform === "win32" }, async () => {
     const dir = makeScratchDir("gw-auth-mode-");
     ctx.dir = dir;
     const token = genToken();
@@ -199,7 +199,7 @@ describe("gateway local auth", () => {
     );
   });
 
-  it("token_file_must_be_mode_0600_and_min_32_chars", async () => {
+  it("token_file_must_be_mode_0600_and_min_32_chars", { skip: process.platform === "win32" }, async () => {
     const dir = makeScratchDir("gw-auth-tokmode-");
     ctx.dir = dir;
     const keysPath = writeKeysFile(

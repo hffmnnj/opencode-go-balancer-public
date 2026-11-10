@@ -26,8 +26,10 @@ export function readPrivateFile(path: string): string {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const stat = fstatSync(fd);
-    if (!stat.isFile() || (stat.mode & 0o777) !== 0o600 ||
-        (process.getuid && stat.uid !== process.getuid()) || stat.size > 64 * 1024) {
+    // Windows NTFS reports 0o666 for arbitrary files; access is governed by ACLs,
+    // so the POSIX 0600-mode and owner-uid checks apply only off-win32.
+    const posixPrivate = (stat.mode & 0o777) === 0o600 && (!process.getuid || stat.uid === process.getuid());
+    if (!stat.isFile() || (process.platform !== "win32" && !posixPrivate) || stat.size > 64 * 1024) {
       throw new Error("Invalid private file");
     }
     return readFileSync(fd, "utf8");
