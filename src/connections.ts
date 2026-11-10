@@ -9,6 +9,22 @@ export interface RouterContext {
   };
   session: { get(input: { sessionID: string }): Promise<{ time: { created: number } }> };
 }
+
+export interface RouterOptions {
+  // Saved OpenCode OAuth connection labels pairing the host's two Go accounts;
+  // hosts may name them differently. Default preserves the original pair.
+  connectionLabels?: [string, string] | unknown;
+}
+
+// Validates the optional connection-labels configuration; never guesses.
+export function connectionLabelsFrom(option: unknown): [string, string] {
+  if (option === undefined) return ["Default", "Secondary"];
+  if (Array.isArray(option) && option.length === 2 && option.every(l => typeof l === "string") &&
+      (option[0] as string).trim() && (option[1] as string).trim() && option[0] !== option[1]) {
+    return [option[0] as string, option[1] as string];
+  }
+  throw new Error("connectionLabels must be two distinct nonempty strings");
+}
 const stateKey = "connections/v1";
 const lockKey = Symbol.for("opencode-go-balancer.connections.v1.lock");
 type Lock = { tail: Promise<void> };
@@ -80,7 +96,8 @@ function retryDelayMs(raw: string | null | undefined, t: number): number {
   return Math.max(cooldownMinimumMs, date - t);
 }
 
-export function createConnectionRouter(ctx: RouterContext, now: () => number = Date.now) {
+export function createConnectionRouter(ctx: RouterContext, now: () => number = Date.now, options: RouterOptions = {}) {
+  const labels = connectionLabelsFrom(options.connectionLabels);
   async function route(sessionID: string, destination: string): Promise<{ headers: Headers; connectionID: string } | undefined> {
     // Validate before storage access or credential resolution.
     assertGoDestination(destination);
@@ -120,7 +137,7 @@ export function createConnectionRouter(ctx: RouterContext, now: () => number = D
   }
   async function connections() {
     const integration = await ctx.integration.get({ integrationID: "opencode" });
-    const pair = ["Default", "Secondary"].map(label => {
+    const pair = labels.map(label => {
       const matches = integration.data.connections.filter(c => c.type === "credential" && c.label === label);
       const match = matches[0];
       if (matches.length !== 1 || match.type !== "credential" || match.method !== "oauth") {
@@ -147,7 +164,7 @@ export function createConnectionRouter(ctx: RouterContext, now: () => number = D
       const saved = await state();
       return {
         cutoff: saved.cutoff,
-        nextConnection: saved.next === 0 ? "Default" : "Secondary",
+        nextConnection: saved.next === 0 ? labels[0] : labels[1],
         pinnedSessions: Object.keys(saved.pins).length,
         connectionID: sessionID && Object.hasOwn(saved.pins, sessionID) ? saved.pins[sessionID] : null,
         cooldowns: { ...saved.cooldowns },

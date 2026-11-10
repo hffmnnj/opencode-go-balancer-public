@@ -2,7 +2,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { createGateway } from "./gateway.ts";
 
-const directory = join(homedir(), ".config/opencode-v2/opencode-go-balancer");
+const directory = join(homedir(), process.platform === "win32" ? ".config/opencode/opencode-go-balancer" : ".config/opencode-v2/opencode-go-balancer");
 const port = Number(process.env.GO_BALANCER_PORT ?? "4790");
 if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("Invalid gateway port");
 try {

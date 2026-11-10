@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { ConnectionInfo } from "@opencode/client";
 import { Credential, Integration } from "@opencode/plugin";
-import { createConnectionRouter, type RouterContext } from "../src/connections.ts";
+import { createConnectionRouter, connectionLabelsFrom, type RouterContext } from "../src/connections.ts";
 
 const destination = "https://opencode.ai/inference/go/openai/v1/chat/completions";
 function fixture() {
@@ -351,4 +351,37 @@ test("limits are ignored for sessions without a pin and invalid destinations are
   await assert.rejects(router.recordLimit("a", "http://opencode.ai/inference/go/a", "5", "default-id"), /Unexpected OpenCode Go destination/);
   assert.equal(JSON.stringify(f.values.get("connections/v1")), before);
   assert.deepEqual((await router.status()).cooldowns, {});
+});
+
+test("connectionLabels is validated and custom labels route by label, not by default name", async () => {
+  for (const bad of [null, "Default", ["A"], ["A", "B", "C"], ["A", 1], ["A", "A"], ["A", ""]]) {
+    assert.throws(() => connectionLabelsFrom(bad), /two distinct nonempty strings/);
+  }
+  assert.deepEqual(connectionLabelsFrom(undefined), ["Default", "Secondary"]);
+  assert.deepEqual(connectionLabelsFrom(["OpenCode Go", "OpenCode Go 2"]), ["OpenCode Go", "OpenCode Go 2"]);
+
+  const f = fixture();
+  f.setConnections([
+    { type: "credential", id: "go-one-id", label: "OpenCode Go", method: "oauth" },
+    { type: "credential", id: "go-two-id", label: "OpenCode Go 2", method: "oauth" },
+  ]);
+  const ctx = {
+    ...f.ctx,
+    integration: {
+      ...f.ctx.integration,
+      connection: {
+        ...f.ctx.integration.connection,
+        // The fixture caps the active connection by id; mirror it for custom ids.
+        active: async () => ({ type: "credential" as const, id: "go-two-id", label: "OpenCode Go 2", method: "oauth" as const }),
+      },
+    },
+  };
+  const router = createConnectionRouter(ctx, () => 100, { connectionLabels: ["OpenCode Go", "OpenCode Go 2"] });
+  await router.initialize();
+  await router.headers("a", destination);
+  assert.equal((await router.status("a")).connectionID, "go-one-id");
+  await router.headers("b", destination);
+  assert.equal((await router.status("b")).connectionID, "go-two-id");
+  assert.deepEqual((await router.status()).nextConnection, "OpenCode Go");
+  await assert.rejects(createConnectionRouter(f.ctx, () => 100).initialize(), /named Default/);
 });
