@@ -49,8 +49,7 @@ async function fixture() {
   assert.ok(request);
   assert.ok(response);
   assert.ok(status);
-  assert.ok(retry);
-  return { hooks, call: request, respond: response, retry, status };
+  return { hooks, call: request, respond: response, retry: async (event: RetryEvent) => { await retry?.(event); }, status };
 }
 
 function responseEvent(sessionID: string, statusCode: number, retryAfter?: string, providerID = "opencode-go") {
@@ -80,7 +79,7 @@ function retryEvent(sessionID: string, status: number, providerID = "opencode-go
 
 test("auxiliary-first, primary, continuation, title and compaction share one pin; native retries remain enabled", async () => {
   const f = await fixture();
-  assert.deepEqual(f.hooks, ["http.request", "http.response", "retry", "experimental.ws.handshake"]);
+  assert.deepEqual(f.hooks, ["http.request", "http.response", "experimental.ws.handshake"]);
   for (const kind of ["title", "primary", "primary", "compaction", "generate"] as const) {
     const e = event("one", kind);
     await f.call(e);
@@ -134,7 +133,26 @@ test("non-Go and historical-session requests retain their original account heade
   }
 });
 
-test("a managed 429 redirects native retry to OpenCode Go 2 with paired headers and a durable pin", async () => {
+test("a rate-limited session retains its caller and native retry decision", async () => {
+  const f = await fixture();
+  const first = event("one");
+  await f.call(first);
+  assert.equal(first.request.headers.get("authorization"), "Bearer access-d");
+  await f.respond({ ...responseEvent("one", 429, "120"), request: first.request });
+
+  const retry = event("one");
+  await f.call(retry);
+  assert.equal(retry.request.headers.get("authorization"), "Bearer access-d");
+  assert.equal(retry.request.headers.get("x-opencode-org-id"), "org-d");
+  assert.equal(await retry.request.text(), "original body");
+  assert.equal((await f.status({ sessionID: "one" }) as StatusResult).connectionID, "d");
+
+  const decision = retryEvent("one", 429);
+  await f.retry(decision);
+  assert.deepEqual(decision.decision, { retry: true, delay: 120_000 });
+});
+
+test("a managed 429 leaves the session pinned while new sessions skip the cooled account", async () => {
   const f = await fixture();
   const first = event("one");
   await f.call(first);
@@ -154,12 +172,12 @@ test("a managed 429 redirects native retry to OpenCode Go 2 with paired headers 
   assert.equal(third.request.headers.get("x-opencode-org-id"), "org-s");
   const decision = retryEvent("one", 429);
   await f.retry(decision);
-  assert.deepEqual(decision.decision, { retry: true, delay: 100 });
+  assert.deepEqual(decision.decision, { retry: true, delay: 120_000 });
   const retry = event("one");
   await f.call(retry);
-  assert.equal(retry.request.headers.get("authorization"), "Bearer access-s");
-  assert.equal(retry.request.headers.get("x-opencode-org-id"), "org-s");
-  assert.equal((await f.status({ sessionID: "one" }) as StatusResult).connectionID, "s");
+  assert.equal(retry.request.headers.get("authorization"), "Bearer access-d");
+  assert.equal(retry.request.headers.get("x-opencode-org-id"), "org-d");
+  assert.equal((await f.status({ sessionID: "one" }) as StatusResult).connectionID, "d");
 });
 
 test("only managed 429 responses are recorded and the response is never altered", async () => {
@@ -188,22 +206,24 @@ test("only managed 429 responses are recorded and the response is never altered"
   assert.doesNotMatch(JSON.stringify(cooled), /access-|org-|refresh/);
 });
 
-test("delayed concurrent 429s cool their actual request account, not the new session pin", async () => {
+test("delayed concurrent 429s cool their actual request accounts while both session pins remain unchanged", async () => {
   const f = await fixture();
   const first = event("one");
-  const delayed = event("one", "title");
+  const delayed = event("two", "title");
   await Promise.all([f.call(first), f.call(delayed)]);
   await f.respond({ ...responseEvent("one", 429, "120"), request: first.request });
   const retries = [event("one"), event("one", "compaction")];
   await Promise.all(retries.map(e => f.call(e)));
   for (const e of retries) {
-    assert.equal(e.request.headers.get("authorization"), "Bearer access-s");
-    assert.equal(e.request.headers.get("x-opencode-org-id"), "org-s");
+    assert.equal(e.request.headers.get("authorization"), "Bearer access-d");
+    assert.equal(e.request.headers.get("x-opencode-org-id"), "org-d");
   }
-  await f.respond({ ...responseEvent("one", 429, "300"), request: delayed.request });
+  await f.respond({ ...responseEvent("two", 429, "300"), request: delayed.request });
   const after = await f.status({ sessionID: "one" }) as StatusResult;
-  assert.equal(after.connectionID, "s");
-  assert.deepEqual(Object.keys(after.cooldowns), ["d"]);
+  assert.equal(after.connectionID, "d");
+  assert.equal((await f.status({ sessionID: "two" }) as StatusResult).connectionID, "s");
+  assert.deepEqual(Object.keys(after.cooldowns).sort(), ["d", "s"]);
+  assert.ok(after.cooldowns.s! > after.cooldowns.d!);
   await f.respond({ ...responseEvent("one", 429, "400"), request: retries[0]!.request });
   const decision = retryEvent("one", 429);
   await f.retry(decision);
@@ -213,10 +233,10 @@ test("delayed concurrent 429s cool their actual request account, not the new ses
   assert.equal(bothCooled.request.headers.get("authorization"), "Bearer access-d");
 });
 
-test("retry hook leaves auth, network, non-Go and unmanaged retry decisions unchanged", async () => {
+test("native auth, network, non-Go and unmanaged retry decisions remain unchanged", async () => {
   const f = await fixture();
   await f.call(event("one"));
-  for (const e of [retryEvent("one", 401), retryEvent("one", 500),
+  for (const e of [retryEvent("one", 401), retryEvent("one", 429), retryEvent("one", 500),
     retryEvent("one", 429, "other-provider"), retryEvent("old", 429), retryEvent("unknown", 429)]) {
     e.decision = { retry: false };
     await f.retry(e);

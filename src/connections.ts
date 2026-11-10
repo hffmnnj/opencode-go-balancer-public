@@ -125,14 +125,14 @@ export function createConnectionRouter(ctx: RouterContext, now: () => number = D
       const t = now();
       const preferred = pinned ? pair.find(c => c.id === pinned)! : pair[saved.next];
       const other = pair.find(c => c.id !== preferred.id)!;
-      // Keep healthy pins. If both are cooling, prefer the earlier deadline,
-      // retaining affinity on ties, and leave real unavailability to native backoff.
-      const chosen = (saved.cooldowns[preferred.id] ?? 0) <= t ? preferred
+      // A session can carry caller-bound reasoning, so only new sessions may
+      // select a different connection when the preferred one is cooling.
+      const chosen = pinned || (saved.cooldowns[preferred.id] ?? 0) <= t ? preferred
         : (saved.cooldowns[other.id] ?? 0) <= t ? other
         : (saved.cooldowns[other.id] ?? 0) < (saved.cooldowns[preferred.id] ?? 0) ? other : preferred;
-      if (chosen.id !== pinned) {
+      if (!pinned) {
         await ctx.storage.set(stateKey, {
-          ...saved, next: pinned ? saved.next : chosen.id === pair[0].id ? 1 : 0,
+          ...saved, next: chosen.id === pair[0].id ? 1 : 0,
           pins: { ...saved.pins, [sessionID]: chosen.id },
         });
       }
@@ -197,13 +197,6 @@ export function createConnectionRouter(ctx: RouterContext, now: () => number = D
       const until = Math.max(saved.cooldowns[connectionID] ?? 0, deadline);
       if (!Number.isSafeInteger(until)) return;
       await ctx.storage.set(stateKey, { ...saved, cooldowns: { ...saved.cooldowns, [connectionID]: until } });
-    }),
-    hasHealthyConnection: (sessionID: string) => exclusive(async () => {
-      const saved = await state();
-      if (!Object.hasOwn(saved.pins, sessionID)) return false;
-      const pair = await connections();
-      if (!pair.some(c => c.id === saved.pins[sessionID])) throw new Error("Pinned Go connection is missing or renamed");
-      return pair.some(c => (saved.cooldowns[c.id] ?? 0) <= now());
     }),
     rejectUnsupportedWebSocket: (sessionID: string) => exclusive(async () => {
       const saved = await state();
