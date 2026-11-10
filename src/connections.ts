@@ -9,6 +9,32 @@ export interface RouterContext {
   };
   session: { get(input: { sessionID: string }): Promise<{ time: { created: number } }> };
 }
+
+export interface RouterOptions {
+  // Saved OpenCode Go connection labels pairing the host's two Go accounts;
+  // hosts may name them differently. Default preserves the original pair.
+  connectionLabels?: [string, string] | unknown;
+  // Integration that owns the Go credentials. Defaults to the Go provider's
+  // own integration so key credentials created by /connect are found.
+  integrationID?: string | unknown;
+}
+
+// Validates the optional connection-labels configuration; never guesses.
+export function connectionLabelsFrom(option: unknown): [string, string] {
+  if (option === undefined) return ["OpenCode Go", "OpenCode Go 2"];
+  if (Array.isArray(option) && option.length === 2 && option.every(l => typeof l === "string") &&
+      (option[0] as string).trim() && (option[1] as string).trim() && option[0] !== option[1]) {
+    return [option[0] as string, option[1] as string];
+  }
+  throw new Error("connectionLabels must be two distinct nonempty strings");
+}
+
+// Validates the optional integration-id configuration; never guesses.
+export function integrationIDFrom(option: unknown): string {
+  if (option === undefined) return "opencode-go";
+  if (typeof option === "string" && option.trim()) return option;
+  throw new Error("integrationID must be a nonempty string");
+}
 const stateKey = "connections/v1";
 const lockKey = Symbol.for("opencode-go-balancer.connections.v1.lock");
 type Lock = { tail: Promise<void> };
@@ -80,7 +106,9 @@ function retryDelayMs(raw: string | null | undefined, t: number): number {
   return Math.max(cooldownMinimumMs, date - t);
 }
 
-export function createConnectionRouter(ctx: RouterContext, now: () => number = Date.now) {
+export function createConnectionRouter(ctx: RouterContext, now: () => number = Date.now, options: RouterOptions = {}) {
+  const labels = connectionLabelsFrom(options.connectionLabels);
+  const integrationID = integrationIDFrom(options.integrationID);
   async function route(sessionID: string, destination: string): Promise<{ headers: Headers; connectionID: string } | undefined> {
     // Validate before storage access or credential resolution.
     assertGoDestination(destination);
@@ -109,6 +137,10 @@ export function createConnectionRouter(ctx: RouterContext, now: () => number = D
         });
       }
       const value = await ctx.integration.connection.resolve(chosen);
+      if (value?.type === "key") {
+        if (typeof value.key !== "string" || !value.key) throw new Error("Pinned Go key connection is unusable");
+        return { connectionID: chosen.id, headers: new Headers({ authorization: `Bearer ${value.key}` }) };
+      }
       if (value?.type !== "oauth" || !value.access || value.expires <= now() ||
           value.metadata?.server !== "https://opencode.ai/console" ||
           typeof value.metadata.orgID !== "string" || !value.metadata.orgID) {
@@ -119,12 +151,12 @@ export function createConnectionRouter(ctx: RouterContext, now: () => number = D
     });
   }
   async function connections() {
-    const integration = await ctx.integration.get({ integrationID: "opencode" });
-    const pair = ["Default", "Secondary"].map(label => {
+    const integration = await ctx.integration.get({ integrationID });
+    const pair = labels.map(label => {
       const matches = integration.data.connections.filter(c => c.type === "credential" && c.label === label);
       const match = matches[0];
-      if (matches.length !== 1 || match.type !== "credential" || match.method !== "oauth") {
-        throw new Error(`Go router requires one saved OAuth connection named ${label}`);
+      if (matches.length !== 1 || match.type !== "credential" || (match.method !== "oauth" && match.method !== "key")) {
+        throw new Error(`Go router requires one saved OAuth or key connection named ${label}`);
       }
       return match;
     });
@@ -135,8 +167,8 @@ export function createConnectionRouter(ctx: RouterContext, now: () => number = D
     const saved = await ctx.storage.get(stateKey);
     if (saved !== undefined) return readState(saved);
     await connections();
-    const active = await ctx.integration.connection.active("opencode");
-    if (active?.type !== "credential" || active.method !== "oauth") throw new Error("Expected an active OpenCode OAuth connection");
+    const active = await ctx.integration.connection.active(integrationID);
+    if (active?.type !== "credential" || (active.method !== "oauth" && active.method !== "key")) throw new Error("Expected an active OpenCode Go connection");
     const initial: State = { version: 1, cutoff: now(), activeAtActivation: active.id, next: 0, pins: {}, cooldowns: {} };
     await ctx.storage.set(stateKey, initial);
     return initial;
@@ -147,7 +179,7 @@ export function createConnectionRouter(ctx: RouterContext, now: () => number = D
       const saved = await state();
       return {
         cutoff: saved.cutoff,
-        nextConnection: saved.next === 0 ? "Default" : "Secondary",
+        nextConnection: saved.next === 0 ? labels[0] : labels[1],
         pinnedSessions: Object.keys(saved.pins).length,
         connectionID: sessionID && Object.hasOwn(saved.pins, sessionID) ? saved.pins[sessionID] : null,
         cooldowns: { ...saved.cooldowns },
