@@ -23,11 +23,11 @@ async function fixture() {
     storage: { get: async (key: string) => values.get(key), set: async (key: string, value: Parameters<RouterContext["storage"]["set"]>[1]) => { values.set(key, value); } },
     integration: {
       get: async () => ({ data: { connections: [
-        { type: "credential", id: "d", label: "Default", method: "oauth" },
-        { type: "credential", id: "s", label: "Secondary", method: "oauth" },
+        { type: "credential", id: "d", label: "OpenCode Go", method: "oauth" },
+        { type: "credential", id: "s", label: "OpenCode Go 2", method: "oauth" },
       ] } }),
       connection: {
-        active: async () => ({ type: "credential", id: "s", method: "oauth", label: "Secondary" }),
+        active: async () => ({ type: "credential", id: "s", method: "oauth", label: "OpenCode Go 2" }),
         resolve: async (c: { id: string }) => Credential.OAuth.make({ type: "oauth", methodID: Integration.MethodID.make("device"), access: `access-${c.id}`,
           refresh: "native", expires: Date.now() + 3600_000, metadata: { orgID: `org-${c.id}`, server: "https://opencode.ai/console" } }),
       },
@@ -95,12 +95,12 @@ test("auxiliary-first, primary, continuation, title and compaction share one pin
 test("status reports durable pins without resolving credentials or allocating sessions", async () => {
   const f = await fixture();
   const before = await f.status({ sessionID: "one" }) as StatusResult;
-  assert.deepEqual(before, { cutoff: before.cutoff, nextConnection: "Default", pinnedSessions: 0, connectionID: null, cooldowns: {} });
+  assert.deepEqual(before, { cutoff: before.cutoff, nextConnection: "OpenCode Go", pinnedSessions: 0, connectionID: null, cooldowns: {} });
   await f.call(event("one"));
   const after = await f.status({ sessionID: "one" }) as StatusResult;
-  assert.deepEqual(after, { cutoff: before.cutoff, nextConnection: "Secondary", pinnedSessions: 1, connectionID: "d", cooldowns: {} });
+  assert.deepEqual(after, { cutoff: before.cutoff, nextConnection: "OpenCode Go 2", pinnedSessions: 1, connectionID: "d", cooldowns: {} });
   assert.deepEqual(await f.status({ sessionID: "unknown" }), {
-    cutoff: before.cutoff, nextConnection: "Secondary", pinnedSessions: 1, connectionID: null, cooldowns: {},
+    cutoff: before.cutoff, nextConnection: "OpenCode Go 2", pinnedSessions: 1, connectionID: null, cooldowns: {},
   });
   assert.doesNotMatch(JSON.stringify(after), /access-|org-|refresh/);
 });
@@ -134,17 +134,17 @@ test("non-Go and historical-session requests retain their original account heade
   }
 });
 
-test("a managed 429 redirects native retry to Secondary with paired headers and a durable pin", async () => {
+test("a managed 429 redirects native retry to OpenCode Go 2 with paired headers and a durable pin", async () => {
   const f = await fixture();
   const first = event("one");
   await f.call(first);
-  // The managed 429 for the session pinned to Default cools that account for 120s.
+  // The managed 429 for the session pinned to OpenCode Go cools that account for 120s.
   await f.respond({ ...responseEvent("one", 429, "120"), request: first.request });
   const cooled = await f.status({ sessionID: "one" }) as StatusResult;
   assert.deepEqual(Object.keys(cooled.cooldowns), ["d"]);
   assert.ok(cooled.cooldowns["d"]! > Date.now());
   assert.equal(cooled.connectionID, "d");
-  // Cursor pointed at Secondary; the next session pins it, then skips cooled Default.
+  // Cursor pointed at OpenCode Go 2; the next session pins it, then skips cooled OpenCode Go.
   const second = event("two");
   await f.call(second);
   assert.equal(second.request.headers.get("authorization"), "Bearer access-s");
