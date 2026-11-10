@@ -1,7 +1,7 @@
 import { Plugin } from "@opencode/plugin";
 import { Rpc } from "@opencode/plugin/rpc";
 import { allowedQuery, matchRoute, strippedHeaders } from "./gateway.ts";
-import { createConnectionRouter, connectionLabelsFrom } from "./connections.ts";
+import { createConnectionRouter, connectionLabelsFrom, integrationIDFrom } from "./connections.ts";
 
 export function redirectRequest(request: Request, sessionID: string, token: string, gatewayURL = "http://127.0.0.1:4790"): Request {
   const original = new URL(request.url);
@@ -29,7 +29,8 @@ export default Plugin.define({
   async setup(ctx) {
     if (ctx.options.enabled !== true) return;
     const labels = connectionLabelsFrom(ctx.options.connectionLabels);
-    const router = createConnectionRouter(ctx, undefined, { connectionLabels: labels });
+    const integrationID = integrationIDFrom(ctx.options.integrationID);
+    const router = createConnectionRouter(ctx, undefined, { connectionLabels: labels, integrationID });
     const requestConnections = new WeakMap<Request, string>();
     await router.initialize();
     await ctx.rpc.register(Rpc.define({
