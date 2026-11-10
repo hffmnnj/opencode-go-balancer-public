@@ -2,15 +2,15 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { ConnectionInfo } from "@opencode/client";
 import { Credential, Integration } from "@opencode/plugin";
-import { createConnectionRouter, type RouterContext } from "../src/connections.ts";
+import { createConnectionRouter, connectionLabelsFrom, integrationIDFrom, type RouterContext } from "../src/connections.ts";
 
 const destination = "https://opencode.ai/inference/go/openai/v1/chat/completions";
 function fixture() {
   const values = new Map<string, Parameters<RouterContext["storage"]["set"]>[1]>();
   const resolved: string[] = [];
   let connections: ConnectionInfo[] = [
-    { type: "credential", id: "default-id", label: "Default", method: "oauth" },
-    { type: "credential", id: "secondary-id", label: "Secondary", method: "oauth" },
+    { type: "credential", id: "default-id", label: "OpenCode Go", method: "oauth" },
+    { type: "credential", id: "secondary-id", label: "OpenCode Go 2", method: "oauth" },
   ];
   let failResolve = false;
   let missing = false;
@@ -61,8 +61,8 @@ test("new concurrent sessions alternate, repeated calls and a second router reta
     assert.equal((await router.headers("new-0", destination))?.get("x-opencode-org-id"), "workspace-default-id");
   }
   assert.equal((await a.headers("next", destination))?.get("authorization"), "Bearer token-default-id");
-  assert.deepEqual(await f.ctx.integration.connection.active("opencode"),
-    { type: "credential", id: "secondary-id", label: "Secondary", method: "oauth" });
+  assert.deepEqual(await f.ctx.integration.connection.active("opencode-go"),
+    { type: "credential", id: "secondary-id", label: "OpenCode Go 2", method: "oauth" });
   assert.equal(JSON.stringify([...f.values]).includes("token-"), false);
   assert.equal(JSON.stringify([...f.values]).includes("unused-native-only"), false);
 });
@@ -95,16 +95,16 @@ test("removed pinned identity and ambiguous names fail closed", async () => {
   await router.initialize();
   await router.headers("new", destination);
   f.setConnections([
-    { type: "credential", id: "replacement", label: "Default", method: "oauth" },
-    { type: "credential", id: "secondary-id", label: "Secondary", method: "oauth" },
+    { type: "credential", id: "replacement", label: "OpenCode Go", method: "oauth" },
+    { type: "credential", id: "secondary-id", label: "OpenCode Go 2", method: "oauth" },
   ]);
   await assert.rejects(router.headers("new", destination), /Pinned Go connection is missing/);
   f.setConnections([
-    { type: "credential", id: "one", label: "Default", method: "oauth" },
-    { type: "credential", id: "two", label: "Default", method: "oauth" },
-    { type: "credential", id: "three", label: "Secondary", method: "oauth" },
+    { type: "credential", id: "one", label: "OpenCode Go", method: "oauth" },
+    { type: "credential", id: "two", label: "OpenCode Go", method: "oauth" },
+    { type: "credential", id: "three", label: "OpenCode Go 2", method: "oauth" },
   ]);
-  await assert.rejects(router.headers("another", destination), /one saved OAuth connection named Default/);
+  await assert.rejects(router.headers("another", destination), /one saved OAuth or key connection named OpenCode Go/);
   assert.deepEqual(f.resolved, ["default-id"]);
 });
 
@@ -146,7 +146,7 @@ function savedPins(f: ReturnType<typeof fixture>) {
   };
 }
 
-test("a cooled Default repins to Secondary before resolving and stays there after reload and expiry", async () => {
+test("a cooled OpenCode Go repins to OpenCode Go 2 before resolving and stays there after reload and expiry", async () => {
   const f = fixture();
   let t = 100;
   const router = createConnectionRouter(f.ctx, () => t);
@@ -154,11 +154,11 @@ test("a cooled Default repins to Secondary before resolving and stays there afte
   assert.equal((await router.headers("a", destination))?.get("authorization"), "Bearer token-default-id");
   assert.equal((await router.headers("b", destination))?.get("authorization"), "Bearer token-secondary-id");
   assert.deepEqual((await router.status()).cooldowns, {});
-  // A managed 429 for the session pinned to Default cools that account for 120s.
+  // A managed 429 for the session pinned to OpenCode Go cools that account for 120s.
   await router.recordLimit("a", destination, "120", "default-id");
   assert.deepEqual((await router.status()).cooldowns, { "default-id": 120_100 });
   t = 200;
-  // The cursor points at Default, yet new sessions skip the cooled account.
+  // The cursor points at OpenCode Go, yet new sessions skip the cooled account.
   assert.equal((await router.headers("c", destination))?.get("authorization"), "Bearer token-secondary-id");
   assert.equal((await router.headers("d", destination))?.get("authorization"), "Bearer token-secondary-id");
   const rerouted = await router.headers("a", destination);
@@ -172,7 +172,7 @@ test("a cooled Default repins to Secondary before resolving and stays there afte
   assert.equal((await router.headers("b", destination))?.get("x-opencode-org-id"), "workspace-secondary-id");
 });
 
-test("a cooled Secondary is skipped once the cursor points at it", async () => {
+test("a cooled OpenCode Go 2 is skipped once the cursor points at it", async () => {
   const f = fixture();
   let t = 100;
   const router = createConnectionRouter(f.ctx, () => t);
@@ -181,9 +181,9 @@ test("a cooled Secondary is skipped once the cursor points at it", async () => {
   assert.equal((await router.headers("b", destination))?.get("authorization"), "Bearer token-secondary-id");
   await router.recordLimit("b", destination, "120", "secondary-id");
   t = 200;
-  // Cursor points at Default, which is healthy, so alternation continues.
+  // Cursor points at OpenCode Go, which is healthy, so alternation continues.
   assert.equal((await router.headers("c", destination))?.get("authorization"), "Bearer token-default-id");
-  // Cursor now points at cooled Secondary, so the new session skips to Default.
+  // Cursor now points at cooled OpenCode Go 2, so the new session skips to OpenCode Go.
   assert.equal((await router.headers("d", destination))?.get("authorization"), "Bearer token-default-id");
   const retried = await router.headers("b", destination);
   assert.equal(retried?.get("authorization"), "Bearer token-default-id");
@@ -208,8 +208,8 @@ test("both cooled accounts still route to the earliest expiry and preserve pins 
   t = 100;
   await router.recordLimit("a", destination, "300", "default-id");
   assert.equal((await router.headers("a", destination))?.get("authorization"), "Bearer token-default-id");
-  // The allocation cursor points at Secondary. A tied, cooled Secondary pin
-  // must remain Secondary too, rather than always preferring Default.
+  // The allocation cursor points at OpenCode Go 2. A tied, cooled OpenCode Go 2 pin
+  // must remain OpenCode Go 2 too, rather than always preferring OpenCode Go.
   assert.equal((await router.headers("d", destination))?.get("authorization"), "Bearer token-secondary-id");
   assert.equal((await router.headers("d", destination))?.get("authorization"), "Bearer token-secondary-id");
 });
@@ -277,7 +277,7 @@ test("legacy state without cooldowns migrates unchanged and cooldowns survive re
   const router = createConnectionRouter(f.ctx, () => t);
   await router.initialize();
   assert.deepEqual(await router.status("a"), {
-    cutoff: 100, nextConnection: "Default", pinnedSessions: 1, connectionID: "default-id", cooldowns: {},
+    cutoff: 100, nextConnection: "OpenCode Go", pinnedSessions: 1, connectionID: "default-id", cooldowns: {},
   });
   await router.recordLimit("a", destination, "120", "default-id");
   const reloaded = createConnectionRouter(f.ctx, () => t);
@@ -319,8 +319,8 @@ test("concurrent repins are durable before resolving and never change global act
     ["Bearer token-secondary-id", "workspace-secondary-id"], ["Bearer token-secondary-id", "workspace-secondary-id"],
   ]);
   assert.equal(savedPins(f).next, 1);
-  assert.deepEqual(await f.ctx.integration.connection.active("opencode"),
-    { type: "credential", id: "secondary-id", label: "Secondary", method: "oauth" });
+  assert.deepEqual(await f.ctx.integration.connection.active("opencode-go"),
+    { type: "credential", id: "secondary-id", label: "OpenCode Go 2", method: "oauth" });
 });
 
 test("failed durable repin and native refresh fail closed without resolving a fallback account", async () => {
@@ -351,4 +351,101 @@ test("limits are ignored for sessions without a pin and invalid destinations are
   await assert.rejects(router.recordLimit("a", "http://opencode.ai/inference/go/a", "5", "default-id"), /Unexpected OpenCode Go destination/);
   assert.equal(JSON.stringify(f.values.get("connections/v1")), before);
   assert.deepEqual((await router.status()).cooldowns, {});
+});
+
+test("connectionLabels is validated and custom labels route by label, not by default name", async () => {
+  for (const bad of [null, "Default", ["A"], ["A", "B", "C"], ["A", 1], ["A", "A"], ["A", ""]]) {
+    assert.throws(() => connectionLabelsFrom(bad), /two distinct nonempty strings/);
+  }
+  assert.deepEqual(connectionLabelsFrom(undefined), ["OpenCode Go", "OpenCode Go 2"]);
+  assert.deepEqual(connectionLabelsFrom(["OpenCode Go", "OpenCode Go 2"]), ["OpenCode Go", "OpenCode Go 2"]);
+
+  const f = fixture();
+  f.setConnections([
+    { type: "credential", id: "go-one-id", label: "OpenCode Go", method: "oauth" },
+    { type: "credential", id: "go-two-id", label: "OpenCode Go 2", method: "oauth" },
+  ]);
+  const ctx = {
+    ...f.ctx,
+    integration: {
+      ...f.ctx.integration,
+      connection: {
+        ...f.ctx.integration.connection,
+        // The fixture caps the active connection by id; mirror it for custom ids.
+        active: async () => ({ type: "credential" as const, id: "go-two-id", label: "OpenCode Go 2", method: "oauth" as const }),
+      },
+    },
+  };
+  const router = createConnectionRouter(ctx, () => 100, { connectionLabels: ["OpenCode Go", "OpenCode Go 2"] });
+  await router.initialize();
+  await router.headers("a", destination);
+  assert.equal((await router.status("a")).connectionID, "go-one-id");
+  await router.headers("b", destination);
+  assert.equal((await router.status("b")).connectionID, "go-two-id");
+  assert.deepEqual((await router.status()).nextConnection, "OpenCode Go");
+  const old = fixture();
+  old.setConnections([
+    { type: "credential", id: "default-id", label: "Default", method: "oauth" },
+    { type: "credential", id: "secondary-id", label: "Secondary", method: "oauth" },
+  ]);
+  await assert.rejects(createConnectionRouter(old.ctx, () => 100).initialize(), /named OpenCode Go/);
+});
+
+test("key credentials route with Bearer key headers and no OAuth org header", async () => {
+  const f = fixture();
+  f.setConnections([
+    { type: "credential", id: "go-key-one", label: "OpenCode Go", method: "key" },
+    { type: "credential", id: "go-key-two", label: "OpenCode Go 2", method: "key" },
+  ]);
+  const ctx = {
+    ...f.ctx,
+    integration: {
+      ...f.ctx.integration,
+      connection: {
+        ...f.ctx.integration.connection,
+        active: async () => ({ type: "credential" as const, id: "go-key-two", label: "OpenCode Go 2", method: "key" as const }),
+        resolve: async (c: ConnectionInfo) => {
+          assert.equal(c.type, "credential");
+          if (c.type !== "credential") throw new Error("not saved");
+          return Credential.Key.make({ type: "key", key: `key-${c.id}` });
+        },
+      },
+    },
+  } as unknown as RouterContext;
+  const router = createConnectionRouter(ctx, () => 100);
+  await router.initialize();
+  const first = await router.headers("a", destination);
+  assert.equal(first?.get("authorization"), "Bearer key-go-key-one");
+  assert.equal(first?.get("x-opencode-org-id"), null);
+  const second = await router.headers("b", destination);
+  assert.equal(second?.get("authorization"), "Bearer key-go-key-two");
+  assert.equal(second?.get("x-opencode-org-id"), null);
+  assert.deepEqual((await router.status()).nextConnection, "OpenCode Go");
+});
+
+test("integrationID is validated and defaults to opencode-go", async () => {
+  for (const bad of [null, 1, "", "   "]) {
+    assert.throws(() => integrationIDFrom(bad), /integrationID must be a nonempty string/);
+  }
+  assert.equal(integrationIDFrom(undefined), "opencode-go");
+  assert.equal(integrationIDFrom("custom-go"), "custom-go");
+
+  const f = fixture();
+  const seen: string[] = [];
+  const ctx = {
+    ...f.ctx,
+    integration: {
+      ...f.ctx.integration,
+      get: async (input: { integrationID: string }) => { seen.push(input.integrationID); return f.ctx.integration.get(input); },
+      connection: {
+        ...f.ctx.integration.connection,
+        active: async (integrationID: string) => { seen.push(integrationID); return f.ctx.integration.connection.active(integrationID); },
+      },
+    },
+  };
+  const router = createConnectionRouter(ctx, () => 100);
+  await router.initialize();
+  await router.headers("a", destination);
+  assert.deepEqual(seen, ["opencode-go", "opencode-go", "opencode-go", "opencode-go"]);
+  assert.equal((await router.status()).nextConnection, "OpenCode Go 2");
 });

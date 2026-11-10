@@ -10,8 +10,16 @@ provider. The authoritative contract is [`docs/SPEC.md`](docs/SPEC.md).
 ## Routing behavior
 
 - Alternate new Go agent sessions once at first launch between the two
-  already-connected saved OAuth accounts named `Default` and `Secondary`
-  (integration `opencode`, provider `opencode-go`).
+  already-connected saved OpenCode Go accounts named `OpenCode Go` and
+  `OpenCode Go 2` (integration `opencode-go`, provider `opencode-go`). Hosts
+  that name their connections differently can override this with the plugin
+  option `connectionLabels` (two distinct nonempty strings, in
+  primary/secondary order); it defaults to `["OpenCode Go", "OpenCode Go 2"]`.
+  The owning integration can be overridden with `integrationID`; it defaults
+  to `opencode-go`.
+- Platform: private credential files enforce POSIX `0600` mode and owner checks
+  on Linux/macOS (`~/.config/opencode-v2/opencode-go-balancer/`) and trust NTFS
+  ACLs on Windows (`~/.config/opencode/opencode-go-balancer/`).
 - For new sessions, skip a connection known to be rate-limited and use the
   other account.
 - Keep the selected account sticky across normal requests and plugin reloads.
@@ -44,15 +52,15 @@ provider. The authoritative contract is [`docs/SPEC.md`](docs/SPEC.md).
 ## Verified current state
 
 - Live host is `2.0.32`.
-- Both `Default` and `Secondary` connections have been verified through
+- Both `OpenCode Go` and `OpenCode Go 2` connections have been verified through
   authenticated metadata reads, without displaying secrets.
-- `Secondary` is currently the globally active account; the router must not
+- `OpenCode Go 2` is currently the globally active account; the router must not
   change that.
 - The old gateway service is inactive. Historical gateway source remains in
   the repository but is outside the new plugin's routing path.
 - The router uses the scoped native `http.request` hook and resolves each
-  pinned credential by ID, including native OAuth refresh. Bearer and account
-  organization headers are replaced together.
+  pinned credential by ID, including native OAuth refresh and native Go API-key
+  credentials. Bearer and account organization headers are replaced together.
 - Activation used the configuration watcher without restarting the host or
   changing the globally active account. The authenticated `go-router/status`
   RPC reports pins and allocation metadata, never credential values.
