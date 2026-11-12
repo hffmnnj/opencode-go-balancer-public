@@ -70,10 +70,6 @@ export default Plugin.define({
       if (!connectionID) return;
       await router.recordLimit(event.sessionID, event.request.url, event.response.headers.get("retry-after"), connectionID);
     }, { providerID: "opencode-go" });
-    await ctx.session.hook("retry", async event => {
-      if (event.model.providerID !== "opencode-go" || event.error.status !== 429) return;
-      if (await router.hasHealthyConnection(event.sessionID)) event.decision = { retry: true, delay: 100 };
-    }, { providerID: "opencode-go" });
     await ctx.session.hook("experimental.ws.handshake", async event => {
       if (event.model.providerID === "opencode-go") await router.rejectUnsupportedWebSocket(event.sessionID);
     }, { providerID: "opencode-go" });
