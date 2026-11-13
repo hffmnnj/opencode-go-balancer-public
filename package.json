@@ -1,18 +1,32 @@
 {
-  "name": "opencode-go-balancer",
-  "private": true,
+  "name": "hffmnnj.go-balancer",
+  "version": "0.1.0",
+  "description": "Session-pinned account router for the opencode-go provider in OpenCode V2",
   "type": "module",
   "main": "index.ts",
   "exports": { ".": "./index.ts" },
+  "files": [
+    "index.ts",
+    "src/**/*.ts",
+    "README.md",
+    "assets/banner.png"
+  ],
   "engines": { "node": ">=26" },
+  "publishConfig": { "access": "public" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hffmnnj/opencode-go-balancer.git"
+  },
   "scripts": {
     "keys": "python3 scripts/set-keys.py",
     "start": "node src/cli.ts",
     "test": "node --test test/*.test.ts verification/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "@opencode/plugin": "2.0.32"
+  },
   "devDependencies": {
-    "@opencode/plugin": "2.0.32",
     "@types/node": "26.6.5",
     "typescript": "5.9.3"
   }
