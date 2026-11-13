@@ -1,6 +1,7 @@
 [Unit]
 Description=OpenCode Go round-robin balancer
-Documentation=file:///opt/opencode-go-balancer/README.md
+# %h is the home directory of the user running this user unit.
+Documentation=file://%h/Documents/opencode-go-balancer/README.md
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=60
@@ -8,8 +9,8 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/opencode-go-balancer
-ExecStart=/usr/bin/node /opt/opencode-go-balancer/src/cli.ts
+WorkingDirectory=%h/Documents/opencode-go-balancer
+ExecStart=/usr/bin/node %h/Documents/opencode-go-balancer/src/cli.ts
 Environment=NODE_ENV=production
 Restart=on-failure
 RestartSec=2
