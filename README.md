@@ -2,14 +2,16 @@
 
 ![OpenCode Go Balancer](assets/banner.png)
 
+> The account router retains the caller assigned to each managed session,
+> including when that caller is rate-limited.
+
 Account-based, session-pinned router for the `opencode-go` provider in OpenCode
 V2. It alternates new Go sessions between two saved Go connections and keeps
-each session on its chosen connection unless an explicit HTTP 429 requires a
-redirect. It runs inside the existing host through native scoped HTTP hooks and
-native credential resolution: no local gateway, second listener, or copied
-token store.
+each session on its chosen connection across requests, retries, and rate limits.
+It runs inside the existing host through native scoped HTTP hooks and native
+credential resolution: no local gateway, second listener, or copied token store.
 
-Contract: [`docs/SPEC.md`](docs/SPEC.md). Activation, verification, and rollback:
+Activation, verification, and rollback:
 [`docs/DEPLOY.md`](docs/DEPLOY.md).
 
 ## Requirements
@@ -53,19 +55,19 @@ establish their historical account identity.
 - Alternate new Go agent sessions once at first Go HTTP dispatch, skipping a
   locally cooled connection when the other is healthy. Titles and compaction
   share the session's allocation.
-- Keep the selected connection sticky across normal requests and plugin
-  reloads.
-- On a managed HTTP 429, redirect the next request or native retry to the
-  healthy other connection and persist that selection. The session does not
-  switch back merely because the original cooldown expires.
-- If both connections are locally limited, choose the one with the earliest
-  deadline; on equal deadlines the preferred connection wins. Do not raise a
-  local cooldown exception. Genuine upstream limits still use native
-  retry/backoff; redirection cannot manufacture quota.
+- Keep the selected connection sticky across requests, retries, and rate limits
+  while the plugin is active, including when that connection is rate-limited.
+  Native provider backoff applies to a rate-limited session.
+- Never redirect an existing session on rate limits. If both connections are
+  locally limited, a new session chooses the one with the earliest deadline; on
+  equal deadlines the round-robin candidate wins. An existing session keeps its
+  pin. Do not raise a local cooldown exception; genuine upstream limits still
+  use native retry/backoff.
 - Resolve each pinned connection by saved connection ID through OpenCode's
-  native lifecycle, including OAuth refresh and native key credentials. Replace
-  the Bearer and `x-opencode-org-id` headers together for OAuth connections. No
-  copied tokens or local key files.
+  native lifecycle, including OAuth refresh and native key credentials. For
+  OAuth connections, replace the Bearer and `x-opencode-org-id` headers
+  together; key credentials supply their own Bearer token. No copied tokens or
+  local key files.
 - Leave sessions created at or before the activation cutoff unmanaged. Do not
   rewrite their credentials or assign them a new account.
 - Do not change non-Go providers or model choices.
@@ -82,6 +84,9 @@ establish their historical account identity.
   the cursor, the cutoff, and cooldown deadlines.
 - Removing or renaming a required connection fails closed for new and pinned
   sessions. Missing, expired, or unusable native credentials also fail closed.
+- Plugin reactivation is not atomic: requests dispatched while its hooks are
+  unavailable can use the globally active connection. Avoid reloading while
+  managed sessions are running.
 
 ## Rate limits and failure policy
 
@@ -92,13 +97,32 @@ establish their historical account identity.
 - Respect valid `Retry-After` seconds or HTTP dates, with a 1-second minimum and
   a 60-second fallback when the header is absent or invalid. Keep the later
   deadline when rejections overlap.
-- Accelerate a native retry only when another saved connection is healthy.
-  Native retry policy remains responsible for genuine upstream failures.
-- Redirect on explicit rate limits only. Auth failures, malformed router state,
-  unsafe destinations, and missing or ambiguous saved connections still fail
-  closed.
+- Never redirect an existing session on rate limits. Do not accelerate native
+  retries or alter the upstream 429. Genuine upstream failures remain subject to
+  native retry policy and backoff.
+- Cooldowns begin when a managed request observes HTTP 429; the router does not
+  pre-query account quotas.
+- Auth failures, malformed router state, unsafe destinations, and missing or
+  ambiguous saved connections still fail closed.
 - No API-key gateway, additional listener, copied credential store, custom
   fetch/replay loop, or active quota probing.
+
+## Verified current state
+
+- The live host is OpenCode V2 2.0.32.
+- Both configured connections (`OpenCode Go` and `OpenCode Go 2` by default)
+  were verified through authenticated metadata reads without displaying secrets.
+- `OpenCode Go 2` was the globally active account at last verification; the
+  router must not change that.
+- The old gateway service is inactive. Historical gateway source remains in the
+  repository but is outside the plugin's routing path.
+- The router uses the scoped native `http.request` hook and resolves each
+  pinned credential by ID, including native OAuth refresh and native Go API-key
+  credentials. OAuth Bearer and account organization headers are replaced
+  together.
+- Activation used the configuration watcher without restarting the host or
+  changing the globally active account. The authenticated `go-router/status`
+  RPC reports pins and allocation metadata, never credential values.
 
 ## Operational limits
 
@@ -123,6 +147,11 @@ count, the requested session's connection ID or null, and cooldown deadlines in
 milliseconds. It never resolves or returns credentials and never allocates a
 new pin.
 
+The cursor is not an availability prediction: new sessions skip any connection
+whose cooldown is still active. Only managed HTTP 429 responses update
+cooldowns; generic failures do not switch connections. Delayed responses are
+attributed to their actual request connection.
+
 Use supported native agent launches, not manually created or replayed sessions.
 Confirm two new Go sessions use alternating saved connection IDs, repeated calls
 retain the same identity, and the globally active connection and main host
@@ -135,7 +164,12 @@ account used by an already managed session. Stop new Go work, let managed
 sessions finish, then remove only this entry through the configuration watcher.
 Retain native plugin storage; deleting it loses pins and the cursor. Re-enabling
 routing cannot establish account identity for sessions that ran while routing
-was off. See [`docs/DEPLOY.md`](docs/DEPLOY.md).
+was off.
+
+Existing pins are retained as stored. A session already redirected by an older
+version is not automatically restored to its original caller; its old
+caller-bound reasoning may remain unusable. Use a fresh session if the existing
+context fails. See [`docs/DEPLOY.md`](docs/DEPLOY.md).
 
 ## Historical gateway
 
