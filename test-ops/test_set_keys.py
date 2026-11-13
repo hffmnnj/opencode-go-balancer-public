@@ -1,9 +1,9 @@
 """Ops tests for scripts/set-keys.py. Stdlib unittest only.
 
 Covers the pure validation/build helpers plus atomic staging writes.
-Interactive prompting is intentionally untested. All scratch files live
-under the system temporary directory and each test removes only the files it
-created (no recursive deletion).
+Interactive prompting is intentionally untested. All scratch files live in a
+private directory under the system temp directory, and each test removes only
+the files it created (no recursive deletion).
 """
 
 import importlib.util

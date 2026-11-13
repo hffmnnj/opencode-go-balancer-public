@@ -5,6 +5,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import type { AddressInfo } from "node:net";
 
+/** Base for private per-test scratch directories. */
 export const SCRATCH_BASE = os.tmpdir();
 export const KEY_A = "test-key-a";
 export const KEY_B = "test-key-b";
